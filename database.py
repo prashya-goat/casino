@@ -107,3 +107,17 @@ async def recent_matches(uid: int, limit: int = 5):
                 finished_at=m["finished_at"]),
             is_winner=me.get("is_winner", False), series_wins=me.get("series_wins", 0)))
     return rows
+
+
+# --------------------------------------------------------------------------- running matches
+# A running match is saved after every roll, so a redeploy/restart resumes it instead of cancelling.
+async def save_active(snapshot: dict) -> None:
+    await db.active_matches.replace_one({"_id": snapshot["_id"]}, snapshot, upsert=True)
+
+
+async def delete_active(chat_id: int) -> None:
+    await db.active_matches.delete_one({"_id": chat_id})
+
+
+async def load_active() -> list[dict]:
+    return await db.active_matches.find({}).to_list(length=None)
