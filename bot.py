@@ -57,7 +57,7 @@ QUESTIONS = {
 }
 
 
-# ============================================================ wizard views (exact layouts)
+# ============================================================ wizard views (casino style vertical layout with emojis)
 def setup_header(d: dict) -> str:
     lines = [f"⚔️ {mention(d['creator_id'], d['creator_name'])} is setting up a PvP match"]
     if "game" in d:
@@ -78,26 +78,38 @@ def setup_header(d: dict) -> str:
 def step_view(step: str, d: dict) -> tuple[str, InlineKeyboardMarkup]:
     text = setup_header(d) + f"\n\n<blockquote>{QUESTIONS[step]}</blockquote>"
     b = InlineKeyboardBuilder()
-    if step == "game":      # [🎲][🏀] / [⚽][🎳] / [🎯] / [❌ Cancel]
+    
+    # Game selection (Grid style as requested previously)
+    if step == "game":      
         for key, (emoji, name) in GAMES.items():
             b.button(text=f"{emoji} {name}", callback_data=SetupCB(step="game", value=key))
         b.button(text="❌ Cancel", callback_data=SetupCB(step="cancel"))
         b.adjust(2, 2, 1, 1)
-    elif step == "mode":    # [🟢 Normal][🔴 Crazy] / [« Back]
+        
+    # Mode selection (Vertical list)
+    elif step == "mode":    
         b.button(text="🟢 Normal Mode", callback_data=SetupCB(step="mode", value="normal"))
         b.button(text="🔴 Crazy Mode", callback_data=SetupCB(step="mode", value="crazy"))
         b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(2, 1)
-    elif step == "rolls":   # 1 2 3 / 4 5 6 / 7 8 9 / 10 / [« Back]
+        b.adjust(1, 1, 1)
+        
+    # Rolls selection (Vertical stack with game emojis like 🏀 1 Roll)
+    elif step == "rolls":   
+        emoji = GAMES.get(d.get("game", "dice"), ("🎲",))[0]
         for n in range(1, 11):
-            b.button(text=str(n), callback_data=SetupCB(step="rolls", value=str(n)))
+            label = f"{emoji} {n} Roll{'s' if n > 1 else ''}"
+            b.button(text=label, callback_data=SetupCB(step="rolls", value=str(n)))
         b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(3, 3, 3, 1, 1)
-    elif step == "wins":    # 4 per row, 1..20 / [« Back]
+        b.adjust(*(1 for _ in range(12))) # Har row mein ek button (vertical stack)
+        
+    # Wins selection (Vertical stack with clean numbering)
+    elif step == "wins":    
         for n in range(1, 21):
-            b.button(text=str(n), callback_data=SetupCB(step="wins", value=str(n)))
+            label = f"🏆 {n} Win{'s' if n > 1 else ''}"
+            b.button(text=label, callback_data=SetupCB(step="wins", value=str(n)))
         b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(4, 4, 4, 4, 4, 1)
+        b.adjust(*(1 for _ in range(22))) # Har row mein ek button (vertical stack)
+        
     return text, b.as_markup()
 
 
@@ -112,9 +124,6 @@ def validate(step: str, value: str) -> Any:
 
 # ============================================================ RAM-only username memory
 class SeenUsers(BaseMiddleware):
-    """RAM-only memory of recent (chat, @username) -> user id, so `/invite @user` can find the id.
-    Never written to disk or the database; cleared on every restart."""
-
     MAX = 5000
 
     def __init__(self) -> None:
@@ -147,7 +156,6 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 def extract_targets(message: Message) -> tuple[dict[int, str], list[str]]:
-    """Reply / text_mention / @username -> ({user_id: name}, [usernames we couldn't resolve])."""
     me = message.from_user.id if message.from_user else 0
     targets: dict[int, str] = {}
     unknown: list[str] = []
@@ -192,7 +200,7 @@ async def cmd_pvp_private(message: Message) -> None:
 @router.message(Command("pvp"), GROUP)
 async def cmd_pvp(message: Message, state: FSMContext) -> None:
     user = message.from_user
-    if user is None or user.is_bot:  # anonymous admin posts can't be tracked
+    if user is None or user.is_bot:
         return await message.reply("⚠️ Please turn off anonymous-admin mode to start a match.")
     chat_id = message.chat.id
     if manager.get(chat_id):
@@ -206,7 +214,7 @@ async def cmd_pvp(message: Message, state: FSMContext) -> None:
     await state.set_data(d)
     await state.set_state(PvP.choosing_game)
     text, kb = step_view("game", d)
-    await message.reply(text, reply_markup=kb)  # reply => the /pvp command is quoted above the wizard
+    await message.reply(text, reply_markup=kb)
 
 
 async def goto(msg: Message, state: FSMContext, step: str) -> None:
@@ -267,7 +275,7 @@ async def setup_pick(cb: CallbackQuery, callback_data: SetupCB, state: FSMContex
     value = validate(cur, callback_data.value)
     if value is None:
         return await cb.answer()
-    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)  # keep the wizard alive
+    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)
     await state.update_data(**{cur: value})
     await cb.answer()
     if cur == "wins":
@@ -275,13 +283,12 @@ async def setup_pick(cb: CallbackQuery, callback_data: SetupCB, state: FSMContex
     await goto(cb.message, state, ORDER[ORDER.index(cur) + 1])
 
 
-# Anyone else touching a wizard menu (or a stale one):
 @router.callback_query(F.data.startswith("su:"))
 async def setup_not_yours(cb: CallbackQuery) -> None:
     await cb.answer("This menu isn't yours (or it expired) ❌", show_alert=True)
 
 
-# ============================================================ invites (visible only to the invited player + creator)
+# ============================================================ invites
 @router.message(Command("invite"), GROUP)
 async def cmd_invite(message: Message) -> None:
     s = manager.get(message.chat.id)
@@ -291,14 +298,14 @@ async def cmd_invite(message: Message) -> None:
         return await message.reply("Only the match creator can invite players ❌")
 
     targets, unknown = extract_targets(message)
-    try:  # keep the group clean/private: remove the /invite command (needs the 'delete messages' right)
+    try:
         await message.delete()
     except Exception:
         pass
 
     problems: list[str] = []
     for uid, name in targets.items():
-        if uid not in s.invited:  # re-sending to an already invited player is allowed
+        if uid not in s.invited:
             err = s.can_invite(uid)
             if err:
                 problems.append(f"{html.escape(name)}: {err}")
@@ -321,7 +328,7 @@ async def cmd_invite(message: Message) -> None:
 @router.callback_query(InviteCB.filter())
 async def on_invite(cb: CallbackQuery, callback_data: InviteCB) -> None:
     me = cb.from_user
-    if me.id != callback_data.user_id:  # security: the invite works only for the targeted user
+    if me.id != callback_data.user_id:
         return await cb.answer("This invite is not for you! ❌", show_alert=True)
 
     s = manager.get(callback_data.chat_id)
@@ -343,7 +350,6 @@ async def on_invite(cb: CallbackQuery, callback_data: InviteCB) -> None:
     await cb.answer("You're in! 🎉")
 
 
-# ============================================================ lobby buttons
 @router.callback_query(F.data.in_({"lobby:start", "lobby:cancel"}))
 async def on_lobby(cb: CallbackQuery, state: FSMContext) -> None:
     s = manager.get(cb.message.chat.id)
@@ -365,14 +371,13 @@ async def on_lobby(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PvP.in_match)
 
 
-# ============================================================ in-match: dice
 @router.message(F.dice, GROUP)
 async def on_dice(message: Message) -> None:
     s = manager.get(message.chat.id)
     if not s or s.status != "running" or message.from_user is None:
         return
     if message.forward_origin is not None or message.via_bot is not None:
-        return  # forwarded / inline-bot dice never count
+        return
     await s.handle_dice(message.from_user.id, message.dice.emoji, message.dice.value, message.date)
 
 
@@ -397,7 +402,6 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
 
 @router.message(Command("forcestop"), GROUP)
 async def cmd_forcestop(message: Message) -> None:
-    """Emergency switch for the BOT OWNER only (OWNER_IDS env). Players cannot use it."""
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     s = manager.get(message.chat.id)
@@ -407,7 +411,6 @@ async def cmd_forcestop(message: Message) -> None:
     await message.reply("🛑 Match removed by the bot owner (no stats recorded).")
 
 
-# ============================================================ stats
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
     rep = message.reply_to_message
@@ -453,7 +456,6 @@ async def cmd_history(message: Message) -> None:
     await message.reply("\n".join(lines))
 
 
-# ============================================================ main
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -481,10 +483,10 @@ async def main() -> None:
     ])
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await manager.restore_all(bot)  # continue matches that were running before the restart
+        await manager.restore_all(bot)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await manager.shutdown(bot)     # running matches are saved, not cancelled
+        await manager.shutdown(bot)
         await database.close_db()
         await bot.session.close()
 
