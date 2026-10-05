@@ -20,11 +20,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 import database
-from game import GAMES, MAX_PLAYERS, MIN_PLAYERS, MODES, GameSession, InviteCB, lobby_markup, manager, mention
+from game import (GAMES, MAX_PLAYERS, MIN_PLAYERS, MODES, GameSession, InviteCB, lobby_markup,
+                  manager, mention)
 
 log = logging.getLogger("pvp.bot")
 router = Router()
 GROUP = F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
+OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
 
 # ============================================================ FSM + callback data
@@ -38,56 +40,80 @@ class PvP(StatesGroup):
 
 
 class SetupCB(CallbackData, prefix="su"):
-    step: str
+    step: str       # game | mode | rolls | wins | back | cancel
     value: str = ""
 
 
-# ============================================================ keyboards
-def _cancel(b: InlineKeyboardBuilder) -> None:
-    b.button(text="✖️ Cancel", callback_data=SetupCB(step="cancel"))
+STATE_OF = {"game": PvP.choosing_game, "mode": PvP.choosing_mode,
+            "rolls": PvP.choosing_rolls, "wins": PvP.choosing_wins}
+STEP_OF_STATE = {st.state: step for step, st in STATE_OF.items()}
+SETUP_STATES = tuple(STATE_OF.values())
+ORDER = ["game", "mode", "rolls", "wins"]
+QUESTIONS = {
+    "game": "Which game?",
+    "mode": "Which mode?\nNormal — highest total wins\nCrazy — lowest total wins",
+    "rolls": "How many rolls per round?",
+    "wins": "First to how many wins?",
+}
 
 
-def game_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for key, (emoji, name) in GAMES.items():
-        b.button(text=f"{emoji} {name}", callback_data=SetupCB(step="game", value=key))
-    _cancel(b)
-    b.adjust(2, 2, 1, 1)
-    return b.as_markup()
-
-
-def mode_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for key, (emoji, name, desc) in MODES.items():
-        b.button(text=f"{emoji} {name} — {desc}", callback_data=SetupCB(step="mode", value=key))
-    _cancel(b)
-    b.adjust(1)
-    return b.as_markup()
-
-
-def number_kb(step: str, upto: int) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for n in range(1, upto + 1):
-        b.button(text=str(n), callback_data=SetupCB(step=step, value=str(n)))
-    _cancel(b)
-    b.adjust(*([5] * (upto // 5)), 1)
-    return b.as_markup()
-
-
-def summary(d: dict) -> str:
-    parts = []
+# ============================================================ wizard views (exact layouts)
+def setup_header(d: dict) -> str:
+    lines = [f"⚔️ {mention(d['creator_id'], d['creator_name'])} is setting up a PvP match"]
     if "game" in d:
-        parts.append("{} {}".format(*GAMES[d["game"]]))
+        lines.append("{} {}".format(*GAMES[d["game"]]))
+    parts = []
     if "mode" in d:
-        parts.append(f"{MODES[d['mode']][0]} {MODES[d['mode']][1]}")
+        e, n, desc = MODES[d["mode"]]
+        parts.append(f"{e} {n} — {desc}")
     if "rolls" in d:
         parts.append(f"{d['rolls']} roll(s)")
-    return "⚙️ " + " · ".join(parts) + "\n\n" if parts else ""
+    if "wins" in d:
+        parts.append(f"first to {d['wins']}")
+    if parts:
+        lines.append(" · ".join(parts))
+    return "\n".join(lines)
 
 
+def step_view(step: str, d: dict) -> tuple[str, InlineKeyboardMarkup]:
+    text = setup_header(d) + f"\n\n<blockquote>{QUESTIONS[step]}</blockquote>"
+    b = InlineKeyboardBuilder()
+    if step == "game":      # [🎲][🏀] / [⚽][🎳] / [🎯] / [❌ Cancel]
+        for key, (emoji, name) in GAMES.items():
+            b.button(text=f"{emoji} {name}", callback_data=SetupCB(step="game", value=key))
+        b.button(text="❌ Cancel", callback_data=SetupCB(step="cancel"))
+        b.adjust(2, 2, 1, 1)
+    elif step == "mode":    # [🟢 Normal][🔴 Crazy] / [« Back]
+        b.button(text="🟢 Normal Mode", callback_data=SetupCB(step="mode", value="normal"))
+        b.button(text="🔴 Crazy Mode", callback_data=SetupCB(step="mode", value="crazy"))
+        b.button(text="« Back", callback_data=SetupCB(step="back"))
+        b.adjust(2, 1)
+    elif step == "rolls":   # 1 2 3 / 4 5 6 / 7 8 9 / 10 / [« Back]
+        for n in range(1, 11):
+            b.button(text=str(n), callback_data=SetupCB(step="rolls", value=str(n)))
+        b.button(text="« Back", callback_data=SetupCB(step="back"))
+        b.adjust(3, 3, 3, 1, 1)
+    elif step == "wins":    # 4 per row, 1..20 / [« Back]
+        for n in range(1, 21):
+            b.button(text=str(n), callback_data=SetupCB(step="wins", value=str(n)))
+        b.button(text="« Back", callback_data=SetupCB(step="back"))
+        b.adjust(4, 4, 4, 4, 4, 1)
+    return text, b.as_markup()
+
+
+def validate(step: str, value: str) -> Any:
+    if step == "game":
+        return value if value in GAMES else None
+    if step == "mode":
+        return value if value in MODES else None
+    hi = 10 if step == "rolls" else 20
+    return int(value) if value.isdigit() and 1 <= int(value) <= hi else None
+
+
+# ============================================================ RAM-only username memory
 class SeenUsers(BaseMiddleware):
-    """RAM-only memory of recent (chat, @username) -> user id, so `/invite @user` can send a
-    private invite. Never written to disk or the database; cleared on every restart."""
+    """RAM-only memory of recent (chat, @username) -> user id, so `/invite @user` can find the id.
+    Never written to disk or the database; cleared on every restart."""
 
     MAX = 5000
 
@@ -120,17 +146,35 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     return m.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
 
 
-# ============================================================ basic commands
+def extract_targets(message: Message) -> tuple[dict[int, str], list[str]]:
+    """Reply / text_mention / @username -> ({user_id: name}, [usernames we couldn't resolve])."""
+    me = message.from_user.id if message.from_user else 0
+    targets: dict[int, str] = {}
+    unknown: list[str] = []
+    rep = message.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot and rep.from_user.id != me:
+        targets[rep.from_user.id] = rep.from_user.full_name
+    for ent in message.entities or []:
+        if ent.type == MessageEntityType.TEXT_MENTION and ent.user and not ent.user.is_bot and ent.user.id != me:
+            targets[ent.user.id] = ent.user.full_name
+        elif ent.type == MessageEntityType.MENTION:
+            uname = ent.extract_from(message.text)[1:]
+            hit = seen.lookup(message.chat.id, uname)
+            if hit is None:
+                unknown.append(uname)
+            elif hit[0] != me:
+                targets[hit[0]] = hit[1]
+    return targets, unknown
+
+
+# ============================================================ help
 HELP = (
     "🎮 <b>PvP Games Bot</b>\n\n"
-    "Add me to a group and use:\n"
-    "/pvp — set up & start a match (2–7 players)\n"
-    "/invite — invite players privately (reply to them or /invite @user)\n"
-    "/stop — cancel the running match (creator/admin)\n"
-    "/stats — your stats (reply to someone for theirs)\n"
-    "/top — leaderboard\n"
-    "/history — your last matches\n\n"
-    "🎲 Dice · 🏀 Basketball · ⚽ Football · 🎳 Bowling · 🎯 Darts"
+    "/pvp — set up a match in a group (2–7 players)\n"
+    "/invite @username — invite a player (or reply to them with /invite)\n"
+    "/stats · /top · /history — your stats, leaderboard, last matches\n\n"
+    "On your turn, send the game emoji yourself (🎲 🏀 ⚽ 🎳 🎯). Don't throw within 60s and I throw for you.\n"
+    "⚠️ Once a match has started it can't be stopped."
 )
 
 
@@ -140,28 +184,61 @@ async def cmd_help(message: Message) -> None:
 
 
 # ============================================================ /pvp wizard (FSM)
+@router.message(Command("pvp"), ~GROUP)
+async def cmd_pvp_private(message: Message) -> None:
+    await message.answer("Add me to a group and use /pvp there 🎮")
+
+
 @router.message(Command("pvp"), GROUP)
 async def cmd_pvp(message: Message, state: FSMContext) -> None:
     user = message.from_user
     if user is None or user.is_bot:  # anonymous admin posts can't be tracked
-        return await message.reply("⚠️ Please disable anonymous-admin mode to start a match.")
+        return await message.reply("⚠️ Please turn off anonymous-admin mode to start a match.")
     chat_id = message.chat.id
     if manager.get(chat_id):
-        return await message.reply("⚠️ A match/lobby is already active here. Use /stop to cancel it.")
+        return await message.reply("⚠️ A match/lobby is already active in this group.")
     if not manager.reserve_setup(chat_id, user.id):
         return await message.reply("⚠️ Someone is already setting up a match here. Try again in a moment.")
 
+    d = {"creator_id": user.id, "creator_name": user.full_name, "title": message.chat.title or "",
+         "thread_id": message.message_thread_id if message.is_topic_message else None}
     await state.clear()
+    await state.set_data(d)
     await state.set_state(PvP.choosing_game)
-    await state.update_data(
-        creator_id=user.id, creator_name=user.full_name, title=message.chat.title or "",
-        thread_id=message.message_thread_id if message.is_topic_message else None)
-    await message.answer(f"{mention(user.id, user.full_name)} is creating a match!\n\n"
-                         "<b>Step 1/4 — Choose the game:</b>", reply_markup=game_kb())
+    text, kb = step_view("game", d)
+    await message.reply(text, reply_markup=kb)  # reply => the /pvp command is quoted above the wizard
 
 
-@router.callback_query(SetupCB.filter(F.step == "cancel"),
-                       StateFilter(PvP.choosing_game, PvP.choosing_mode, PvP.choosing_rolls, PvP.choosing_wins))
+async def goto(msg: Message, state: FSMContext, step: str) -> None:
+    d = await state.get_data()
+    await state.set_state(STATE_OF[step])
+    text, kb = step_view(step, d)
+    try:
+        await msg.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+
+async def open_lobby(msg: Message, state: FSMContext, d: dict) -> None:
+    chat_id = msg.chat.id
+    if manager.get(chat_id):
+        await state.clear()
+        return await msg.edit_text("⚠️ A match already exists in this group.")
+    s = GameSession(msg.bot, chat_id, d.get("thread_id"), d.get("title", ""), d["creator_id"],
+                    d["creator_name"], d["game"], d["mode"], d["rolls"], d["wins"])
+
+    async def _on_close() -> None:
+        await state.clear()
+
+    s.on_close = _on_close
+    s.lobby_msg_id = msg.message_id
+    manager.add(s)
+    await state.set_state(PvP.inviting)
+    await msg.edit_text(s.lobby_text(), reply_markup=lobby_markup())
+    s.start_lobby_timer()
+
+
+@router.callback_query(SetupCB.filter(F.step == "cancel"), StateFilter(*SETUP_STATES))
 async def setup_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     manager.release_setup(cb.message.chat.id)
@@ -169,66 +246,33 @@ async def setup_cancel(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-@router.callback_query(SetupCB.filter(F.step == "game"), PvP.choosing_game)
-async def setup_game(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
-    if callback_data.value not in GAMES:
-        return await cb.answer()
-    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)
-    await state.update_data(game=callback_data.value)
-    await state.set_state(PvP.choosing_mode)
-    await cb.message.edit_text(summary(await state.get_data()) + "<b>Step 2/4 — Choose the mode:</b>",
-                               reply_markup=mode_kb())
-    await cb.answer()
-
-
-@router.callback_query(SetupCB.filter(F.step == "mode"), PvP.choosing_mode)
-async def setup_mode(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
-    if callback_data.value not in MODES:
-        return await cb.answer()
-    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)
-    await state.update_data(mode=callback_data.value)
-    await state.set_state(PvP.choosing_rolls)
-    await cb.message.edit_text(summary(await state.get_data()) + "<b>Step 3/4 — Rolls per player (1–10):</b>",
-                               reply_markup=number_kb("rolls", 10))
-    await cb.answer()
-
-
-@router.callback_query(SetupCB.filter(F.step == "rolls"), PvP.choosing_rolls)
-async def setup_rolls(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
-    if not callback_data.value.isdigit() or not 1 <= int(callback_data.value) <= 10:
-        return await cb.answer()
-    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)
-    await state.update_data(rolls=int(callback_data.value))
-    await state.set_state(PvP.choosing_wins)
-    await cb.message.edit_text(summary(await state.get_data()) + "<b>Step 4/4 — Series wins needed (1–20):</b>",
-                               reply_markup=number_kb("wins", 20))
-    await cb.answer()
-
-
-@router.callback_query(SetupCB.filter(F.step == "wins"), PvP.choosing_wins)
-async def setup_wins(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
-    if not callback_data.value.isdigit() or not 1 <= int(callback_data.value) <= 20:
+@router.callback_query(SetupCB.filter(F.step == "back"), StateFilter(*SETUP_STATES))
+async def setup_back(cb: CallbackQuery, state: FSMContext) -> None:
+    cur = STEP_OF_STATE.get(await state.get_state())
+    idx = ORDER.index(cur)
+    if idx == 0:
         return await cb.answer()
     d = await state.get_data()
-    chat_id = cb.message.chat.id
-    if manager.get(chat_id):
-        return await cb.answer("A match already exists in this group.", show_alert=True)
+    d.pop(ORDER[idx - 1], None)
+    await state.set_data(d)
+    await cb.answer()
+    await goto(cb.message, state, ORDER[idx - 1])
 
-    session = GameSession(
-        bot=cb.bot, chat_id=chat_id, thread_id=d.get("thread_id"), chat_title=d.get("title", ""),
-        creator_id=d["creator_id"], creator_name=d["creator_name"], game=d["game"], mode=d["mode"],
-        rolls=d["rolls"], target_wins=int(callback_data.value))
-    session.lobby_msg_id = cb.message.message_id
 
-    async def _on_close() -> None:
-        await state.clear()
-
-    session.on_close = _on_close
-    manager.add(session)
-    await state.set_state(PvP.inviting)
-    await cb.message.edit_text(session.lobby_text(), reply_markup=lobby_markup())
-    session.start_lobby_timer()
-    await cb.answer("Lobby created!")
+@router.callback_query(SetupCB.filter(F.step.in_({"game", "mode", "rolls", "wins"})), StateFilter(*SETUP_STATES))
+async def setup_pick(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
+    cur = STEP_OF_STATE.get(await state.get_state())
+    if callback_data.step != cur:
+        return await cb.answer("That button is outdated.")
+    value = validate(cur, callback_data.value)
+    if value is None:
+        return await cb.answer()
+    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)  # keep the wizard alive
+    await state.update_data(**{cur: value})
+    await cb.answer()
+    if cur == "wins":
+        return await open_lobby(cb.message, state, await state.get_data())
+    await goto(cb.message, state, ORDER[ORDER.index(cur) + 1])
 
 
 # Anyone else touching a wizard menu (or a stale one):
@@ -237,7 +281,7 @@ async def setup_not_yours(cb: CallbackQuery) -> None:
     await cb.answer("This menu isn't yours (or it expired) ❌", show_alert=True)
 
 
-# ============================================================ invites
+# ============================================================ invites (visible only to the invited player + creator)
 @router.message(Command("invite"), GROUP)
 async def cmd_invite(message: Message) -> None:
     s = manager.get(message.chat.id)
@@ -246,80 +290,55 @@ async def cmd_invite(message: Message) -> None:
     if not message.from_user or message.from_user.id != s.creator_id:
         return await message.reply("Only the match creator can invite players ❌")
 
-    targets: dict[str, tuple] = {}  # target -> (HTML label, user id or None)
-    rep = message.reply_to_message
-    if rep and rep.from_user and not rep.from_user.is_bot:
-        u = rep.from_user
-        targets[str(u.id)] = (mention(u.id, u.full_name), u.id)
-
-    for ent in message.entities or []:
-        if ent.type == MessageEntityType.TEXT_MENTION and ent.user and not ent.user.is_bot:
-            targets[str(ent.user.id)] = (mention(ent.user.id, ent.user.full_name), ent.user.id)
-        elif ent.type == MessageEntityType.MENTION:
-            uname = ent.extract_from(message.text)[1:]
-            hit = seen.lookup(message.chat.id, uname)
-            if hit:
-                targets[str(hit[0])] = (mention(hit[0], hit[1]), hit[0])
-            else:
-                targets[uname.lower()] = ("@" + html.escape(uname), None)
-
-    if not targets:
-        return await message.reply("Reply to a player's message with /invite, or use <code>/invite @username</code>.")
+    targets, unknown = extract_targets(message)
+    try:  # keep the group clean/private: remove the /invite command (needs the 'delete messages' right)
+        await message.delete()
+    except Exception:
+        pass
 
     problems: list[str] = []
-    private: list[str] = []
-    public_no_id: list[str] = []
-    for target, (label, uid) in targets.items():
-        if uid is not None and uid in s.players:
-            problems.append(f"{label}: already in the match")
-            continue
-        if target not in s.invited:  # re-sending to an already invited player is allowed
-            err = s.can_invite(target, uid)
+    for uid, name in targets.items():
+        if uid not in s.invited:  # re-sending to an already invited player is allowed
+            err = s.can_invite(uid)
             if err:
-                problems.append(f"{label}: {err}")
+                problems.append(f"{html.escape(name)}: {err}")
                 continue
-        s.invited[target] = label
-        mode = await s.send_invite(target, uid)
-        if mode == "private":
-            private.append(label)
-        elif uid is None:
-            public_no_id.append(label)
+        s.invited[uid] = name
+        fail = await s.send_invite(uid, name)
+        if fail:
+            s.invited.pop(uid, None)
+            problems.append(fail)
+    for uname in unknown:
+        problems.append(f"@{html.escape(uname)}: I can't find them yet — reply to one of their messages with /invite")
 
     await s.refresh_lobby()
-    notes = []
-    if private:
-        notes.append("📩 Private invite sent to " + ", ".join(private) + " — only they can see it. "
-                     "If they don't see it (offline?), use /invite again to resend.")
-    if public_no_id:
-        notes.append("ℹ️ " + ", ".join(public_no_id) + ": I haven't seen them chat here, so I can't message "
-                     "them privately. The invite was posted in the group — only they can use its buttons.")
-    if problems:
-        notes.append("⚠️ Couldn't invite:\n• " + "\n• ".join(problems))
-    if notes:
-        await message.reply("\n\n".join(notes))
+    if not targets and not unknown:
+        await s.tell_creator("Use <code>/invite @username</code>, or reply to a player's message with /invite.")
+    elif problems:
+        await s.tell_creator("⚠️ Couldn't invite:\n• " + "\n• ".join(problems))
 
 
 @router.callback_query(InviteCB.filter())
 async def on_invite(cb: CallbackQuery, callback_data: InviteCB) -> None:
-    me, target = cb.from_user, callback_data.target
-    # Privacy: valid only for the targeted user (matched by id OR by @username)
-    if not (target == str(me.id) or (me.username and target == me.username.lower())):
+    me = cb.from_user
+    if me.id != callback_data.user_id:  # security: the invite works only for the targeted user
         return await cb.answer("This invite is not for you! ❌", show_alert=True)
 
     s = manager.get(callback_data.chat_id)
-    if not s or s.status != "lobby" or (target not in s.invited and me.id not in s.players):
+    if not s or s.status != "lobby" or (me.id not in s.invited and me.id not in s.players):
         return await cb.answer("This invite has expired.", show_alert=True)
 
     if callback_data.action == "no":
-        s.invited.pop(target, None)
-        await s.set_invite_result(target, f"❌ {mention(me.id, me.full_name)} declined the invite.")
+        await s.resolve_invite(me.id, "❌ You declined the invite.", f"❌ {html.escape(me.full_name)} declined your invite.")
         await s.refresh_lobby()
         return await cb.answer("Declined")
 
-    err = s.accept(me.id, me.full_name, target)
+    err = s.accept(me.id, me.full_name)
     if err:
         return await cb.answer(err, show_alert=True)
-    await s.set_invite_result(target, f"✅ You joined the match! ({len(s.players)}/{MAX_PLAYERS})")
+    n = len(s.players)
+    await s.resolve_invite(me.id, f"✅ You joined the match! ({n}/{MAX_PLAYERS})",
+                           f"✅ {html.escape(me.full_name)} joined ({n}/{MAX_PLAYERS})")
     await s.refresh_lobby()
     await cb.answer("You're in! 🎉")
 
@@ -335,45 +354,34 @@ async def on_lobby(cb: CallbackQuery, state: FSMContext) -> None:
 
     if cb.data == "lobby:cancel":
         await s.edit(s.lobby_msg_id, "❌ Lobby cancelled by the creator.")
+        await s.close_invites("❌ The lobby was cancelled.")
         await manager.close(s)
         return await cb.answer("Cancelled")
 
     if len(s.players) < MIN_PLAYERS:
         return await cb.answer(f"Need at least {MIN_PLAYERS} players to start!", show_alert=True)
-    await state.set_state(PvP.in_match)
-    s.start()
     await cb.answer("Match starting! 🚀")
+    await s.start()
+    await state.set_state(PvP.in_match)
 
 
-# ============================================================ in-match: throw button
-@router.callback_query(F.data == "throw")
-async def on_throw(cb: CallbackQuery) -> None:
-    s = manager.get(cb.message.chat.id)
-    if not s or s.status != "running":
-        return await cb.answer("This match is over.", show_alert=True)
-    if s.current_turn is None or cb.message.message_id != s.turn_msg_id:
-        return await cb.answer("That turn is already finished.")
-    if cb.from_user.id != s.current_turn:
-        return await cb.answer("It's not your turn! ⏳", show_alert=True)
-    s.request_bot_throw()
-    await cb.answer("🤖 Throwing for you…")
-
-
+# ============================================================ in-match: dice
 @router.message(F.dice, GROUP)
-async def on_user_dice(message: Message) -> None:
-    """A player threw the emoji themselves during their turn."""
+async def on_dice(message: Message) -> None:
     s = manager.get(message.chat.id)
     if not s or s.status != "running" or message.from_user is None:
         return
     if message.forward_origin is not None or message.via_bot is not None:
-        return  # forwarded / inline-bot dice don't count
-    s.submit_roll(message.from_user.id, message.dice.emoji, message.dice.value, message.date)
+        return  # forwarded / inline-bot dice never count
+    await s.handle_dice(message.from_user.id, message.dice.emoji, message.dice.value, message.date)
 
 
 @router.message(Command("stop", "cancel"), GROUP)
 async def cmd_stop(message: Message, bot: Bot) -> None:
     uid, chat_id = (message.from_user.id if message.from_user else 0), message.chat.id
     s = manager.get(chat_id)
+    if s and s.status == "running":
+        return await message.reply("🔒 The match has already started — it can't be stopped.")
     if not s:
         owner = manager.setup_owner(chat_id)
         if owner and (uid == owner or await is_admin(bot, chat_id, uid)):
@@ -381,9 +389,22 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
             return await message.reply("🛑 Setup cancelled.")
         return await message.reply("Nothing to stop.")
     if uid != s.creator_id and not await is_admin(bot, chat_id, uid):
-        return await message.reply("Only the match creator or a group admin can stop the match ❌")
+        return await message.reply("Only the lobby creator or a group admin can cancel the lobby ❌")
+    await s.edit(s.lobby_msg_id, "❌ Lobby cancelled.")
+    await s.close_invites("❌ The lobby was cancelled.")
     await manager.close(s)
-    await message.reply("🛑 Match cancelled (no stats recorded for unfinished matches).")
+
+
+@router.message(Command("forcestop"), GROUP)
+async def cmd_forcestop(message: Message) -> None:
+    """Emergency switch for the BOT OWNER only (OWNER_IDS env). Players cannot use it."""
+    if not message.from_user or message.from_user.id not in OWNER_IDS:
+        return
+    s = manager.get(message.chat.id)
+    if s:
+        await manager.close(s)
+    await database.delete_active(message.chat.id)
+    await message.reply("🛑 Match removed by the bot owner (no stats recorded).")
 
 
 # ============================================================ stats
@@ -400,7 +421,7 @@ async def cmd_stats(message: Message) -> None:
         f"🎮 Matches: {u.matches_played}\n"
         f"🏆 Wins: {u.wins}   💀 Losses: {u.losses}\n"
         f"📈 Win rate: {rate:.0f}%\n"
-        f"🥇 Series rounds won: {u.rounds_won}\n"
+        f"🥇 Rounds won: {u.rounds_won}\n"
         f"🎯 Total points rolled: {u.total_points}")
 
 
@@ -439,7 +460,6 @@ async def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise SystemExit("BOT_TOKEN is not set (see .env.example)")
-
     uri = os.getenv("MONGODB_URI")
     if not uri:
         raise SystemExit("MONGODB_URI is not set (see .env.example)")
@@ -454,7 +474,6 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="pvp", description="Start a PvP match"),
         BotCommand(command="invite", description="Invite a player to the lobby"),
-        BotCommand(command="stop", description="Cancel the current match"),
         BotCommand(command="stats", description="Your stats"),
         BotCommand(command="top", description="Leaderboard"),
         BotCommand(command="history", description="Your recent matches"),
@@ -462,9 +481,10 @@ async def main() -> None:
     ])
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        await manager.restore_all(bot)  # continue matches that were running before the restart
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await manager.shutdown(bot)
+        await manager.shutdown(bot)     # running matches are saved, not cancelled
         await database.close_db()
         await bot.session.close()
 
