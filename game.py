@@ -1,7 +1,10 @@
-"""Game engine: lobby, turn loop, live scoreboard and per-chat session manager.
+"""Game engine (event driven) + per-chat session manager.
 
-Every group chat gets its own GameSession (keyed by chat_id) running in its own
-asyncio task, so matches in different groups never share state.
+* One GameSession per group chat (keyed by chat_id) -> groups never share state.
+* Players send the game emoji themselves; every dice is counted the moment it arrives.
+* The full match state is saved to MongoDB after every roll, so a redeploy/restart
+  resumes the match exactly where it stopped (see SessionManager.restore_all).
+* A started match cannot be stopped.
 """
 import asyncio
 import html
@@ -27,10 +30,12 @@ log = logging.getLogger("pvp.game")
 
 MIN_PLAYERS = 2
 MAX_PLAYERS = 7
-LOBBY_TIMEOUT = 300   # seconds before an unstarted lobby expires
-SETUP_TIMEOUT = 300   # seconds before an abandoned setup wizard frees the chat
-TURN_TIMEOUT = 60     # seconds of inactivity before the bot throws for the player
-ANIM_DELAY = 4.0      # Telegram dice animation length (also keeps us under flood limits)
+LOBBY_TIMEOUT = 300    # seconds before an unstarted lobby expires
+SETUP_TIMEOUT = 300    # seconds before an abandoned setup wizard frees the chat
+TURN_TIMEOUT = 60      # seconds without a throw before the bot throws for the player
+BOT_ROLL_GAP = 1.5     # pause between the bot's own throws (flood-control friendly)
+WARN_COOLDOWN = 10     # max one "wrong turn" warning per player per N seconds
+VS = "\ufe0f"
 
 GAMES = {
     "dice": ("🎲", "Dice"),
@@ -40,10 +45,14 @@ GAMES = {
     "darts": ("🎯", "Darts"),
 }
 MODES = {
-    "normal": ("📈", "Normal Mode", "highest total wins"),
-    "crazy": ("🤪", "Crazy Mode", "lowest total wins"),
+    "normal": ("🟢", "Normal", "highest total wins"),
+    "crazy": ("🔴", "Crazy", "lowest total wins"),
 }
 MEDALS = ["🥇", "🥈", "🥉"]
+
+
+def esc(s: str) -> str:
+    return html.escape(s)
 
 
 def mention(uid: int, name: str) -> str:
@@ -60,7 +69,7 @@ def lobby_markup() -> InlineKeyboardMarkup:
 class InviteCB(CallbackData, prefix="inv"):
     action: str   # yes | no
     chat_id: int
-    target: str   # user id (digits) or lowercase username
+    user_id: int  # the ONLY user this invite is for
 
 
 @dataclass(eq=False)
@@ -70,7 +79,6 @@ class Player:
     series_wins: int = 0
     total_points: int = 0
     round_rolls: list = field(default_factory=list)
-    done: bool = False
 
 
 class GameSession:
@@ -80,27 +88,27 @@ class GameSession:
         self.creator_id, self.creator_name = creator_id, creator_name
         self.game, self.mode, self.rolls, self.target_wins = game, mode, rolls, target_wins
 
-        self.players: dict[int, Player] = {creator_id: Player(creator_id, creator_name)}
-        # target = str(user_id) or lowercase username  ->  HTML label shown in the lobby
-        self.invited: dict[str, str] = {}
-        # target -> ("eph", ephemeral_id, user_id) | ("pub", message_id)
-        self.invite_msgs: dict[str, tuple] = {}
+        self.players: dict[int, Player] = {creator_id: Player(creator_id, creator_name)}  # join order
+        self.invited: dict[int, str] = {}      # pending invites: user id -> name
+        self.invites: dict[int, dict] = {}     # user id -> ephemeral message ids
 
-        self.status = "lobby"  # lobby -> running -> closed
+        self.status = "lobby"                  # lobby -> running -> finished/closed
         self.lobby_msg_id: Optional[int] = None
-        self.board_msg_id: Optional[int] = None
-        self.turn_msg_id: Optional[int] = None
-        self.board_header = ""
-        self.last_note = ""
-        self.round_no = 0
-        self.participants: list[Player] = []
-        self.current_turn: Optional[int] = None
-        self.roll_event = asyncio.Event()
-        self.bot_throw = False
-        self.turn_date: Optional[datetime] = None
         self.started_at: Optional[datetime] = None
 
-        self.task: Optional[asyncio.Task] = None
+        # match state (all of it is persisted)
+        self.round_no = 0
+        self.turn_idx = 0
+        self.tiebreaks = 0
+        self.participants: list[Player] = []
+
+        self.turn_started: Optional[datetime] = None
+        self.lock = asyncio.Lock()
+        self.warned: dict[int, float] = {}
+        self.timer: Optional[asyncio.Task] = None
+        self.timer_token = 0
+        self._saver: Optional[asyncio.Task] = None
+        self._dirty = False
         self.lobby_task: Optional[asyncio.Task] = None
         self.on_close: Optional[Callable[[], Awaitable[None]]] = None
 
@@ -119,7 +127,17 @@ class GameSession:
 
     def config_line(self) -> str:
         return (f"{self.mode_label} ({MODES[self.mode][2]}) · {self.rolls} roll(s) each · "
-                f"first to {self.target_wins} series win(s)")
+                f"first to {self.target_wins}")
+
+    def current_player(self) -> Player:
+        return self.participants[self.turn_idx]
+
+    def standings(self) -> str:
+        return "\n".join(f"{esc(p.name)} - {p.series_wins}" for p in self.players.values())
+
+    def prompt(self) -> str:
+        p = self.current_player()
+        return f"{mention(p.id, p.name)} to roll — send {self.emoji} ×{self.rolls - len(p.round_rolls)}"
 
     # ------------------------------------------------------------- telegram helpers
     async def _call(self, method, *args, **kwargs):
@@ -145,13 +163,43 @@ class GameSession:
             if "not modified" not in str(e):
                 log.debug("edit failed: %s", e)
 
-    async def delete(self, msg_id: Optional[int]) -> None:
-        if not msg_id:
+    # ---- ephemeral ("only visible to you") messages
+    async def _eph_send(self, uid: int, text: str, kb=None) -> Optional[int]:
+        if EphemeralMessageParameters is None:
+            raise RuntimeError("aiogram >= 3.31 is required for private invites")
+        m = await self.send(text, reply_markup=kb,
+                            ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=uid))
+        return getattr(m, "ephemeral_message_id", None)
+
+    async def _eph_edit(self, uid: int, eid: Optional[int], text: str) -> None:
+        if eid is None:
             return
         try:
-            await self.bot.delete_message(self.chat_id, msg_id)
-        except (TelegramBadRequest, TelegramForbiddenError):
-            pass
+            await self.bot.edit_ephemeral_message_text(
+                chat_id=self.chat_id, receiver_user_id=uid, ephemeral_message_id=eid,
+                text=text, parse_mode="HTML")
+        except Exception as e:
+            log.debug("ephemeral edit failed: %s", e)
+
+    async def _eph_delete(self, uid: int, eid: Optional[int]) -> None:
+        if eid is None:
+            return
+        try:
+            await self.bot.delete_ephemeral_message(
+                chat_id=self.chat_id, receiver_user_id=uid, ephemeral_message_id=eid)
+        except Exception as e:
+            log.debug("ephemeral delete failed: %s", e)
+
+    async def tell_creator(self, text: str) -> None:
+        """Notice visible only to the creator (falls back to a plain reply if ephemeral is unavailable)."""
+        try:
+            await self._eph_send(self.creator_id, text)
+        except Exception as e:
+            log.warning("tell_creator via ephemeral failed (%s)", e)
+            try:
+                await self.send(text)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------- lobby
     def lobby_text(self) -> str:
@@ -163,14 +211,13 @@ class GameSession:
         ]
         lines += [f"• {mention(p.id, p.name)}" for p in self.players.values()]
         if self.invited:
-            lines.append("")
-            lines.append("⏳ <b>Waiting for:</b> " + ", ".join(self.invited.values()))
+            lines.append(f"⏳ {len(self.invited)} invite(s) pending")
         lines += [
             "",
-            "➕ <b>Invite players</b> (creator only):",
-            "• reply to someone's message with /invite (they get a private message only they can see)",
-            "• or <code>/invite @username</code>",
-            f"Need at least {MIN_PLAYERS} players, max {MAX_PLAYERS}. Then press ▶️ Start.",
+            "➕ <b>Invite</b> (creator only): <code>/invite @username</code>, or reply to a player with /invite.",
+            "Only the invited player (and you) can see the invite.",
+            f"Need {MIN_PLAYERS}–{MAX_PLAYERS} players, then press ▶️ Start. "
+            "<b>A started match cannot be stopped.</b>",
         ]
         return "\n".join(lines)
 
@@ -178,27 +225,67 @@ class GameSession:
         if self.status == "lobby":
             await self.edit(self.lobby_msg_id, self.lobby_text(), lobby_markup())
 
-    def can_invite(self, target: str, uid: Optional[int] = None) -> Optional[str]:
+    def can_invite(self, uid: int) -> Optional[str]:
         if self.status != "lobby":
-            return "lobby is closed"
-        if uid is not None and uid in self.players:
+            return "the lobby is closed"
+        if uid in self.players:
             return "already in the match"
-        if target in self.invited:
-            return "already invited"
         if len(self.players) + len(self.invited) >= MAX_PLAYERS:
             return f"all {MAX_PLAYERS} slots are taken/reserved"
         return None
 
-    def accept(self, uid: int, name: str, target: str) -> Optional[str]:
+    def accept(self, uid: int, name: str) -> Optional[str]:
         if uid in self.players:
             return "You're already in! ✅"
-        if target not in self.invited:
+        if uid not in self.invited:
             return "You have no pending invite."
         if len(self.players) >= MAX_PLAYERS:
             return f"The match is full ({MAX_PLAYERS}/{MAX_PLAYERS})."
-        self.invited.pop(target)
+        self.invited.pop(uid)
         self.players[uid] = Player(uid, name)
         return None
+
+    async def send_invite(self, uid: int, name: str) -> Optional[str]:
+        """Private invite (only `uid` sees it) + a small private status note for the creator.
+        Returns None on success, or a short error text."""
+        await self.drop_invite(uid)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Join", callback_data=InviteCB(action="yes", chat_id=self.chat_id, user_id=uid).pack()),
+            InlineKeyboardButton(text="❌ Decline", callback_data=InviteCB(action="no", chat_id=self.chat_id, user_id=uid).pack()),
+        ]])
+        text = (f"👋 {mention(uid, name)}, {mention(self.creator_id, self.creator_name)} invited you to a "
+                f"{self.emoji} <b>{self.game_name}</b> PvP match!\n⚙️ {self.config_line()}")
+        try:
+            target_eid = await self._eph_send(uid, text, kb)
+        except Exception as e:
+            log.warning("private invite to %s failed: %s", uid, e)
+            return f"{esc(name)}: couldn't deliver the private invite"
+        creator_eid = None
+        try:
+            creator_eid = await self._eph_send(self.creator_id, f"📩 Invite sent to {esc(name)} — waiting for a reply…")
+        except Exception:
+            pass
+        self.invites[uid] = {"name": name, "target": target_eid, "creator": creator_eid}
+        return None
+
+    async def drop_invite(self, uid: int) -> None:
+        ref = self.invites.pop(uid, None)
+        if ref:
+            await self._eph_delete(uid, ref.get("target"))
+            await self._eph_delete(self.creator_id, ref.get("creator"))
+
+    async def resolve_invite(self, uid: int, target_text: str, creator_text: str) -> None:
+        self.invited.pop(uid, None)
+        ref = self.invites.pop(uid, None)
+        if ref:
+            await self._eph_edit(uid, ref.get("target"), target_text)
+            await self._eph_edit(self.creator_id, ref.get("creator"), creator_text)
+
+    async def close_invites(self, text: str) -> None:
+        for uid in list(self.invites):
+            name = self.invites[uid]["name"]
+            await self.resolve_invite(uid, text, f"⌛ Invite to {esc(name)} closed.")
+        self.invited.clear()
 
     def start_lobby_timer(self) -> None:
         self.lobby_task = asyncio.create_task(self._lobby_expiry())
@@ -208,252 +295,243 @@ class GameSession:
             await asyncio.sleep(LOBBY_TIMEOUT)
             if self.status == "lobby":
                 await self.edit(self.lobby_msg_id, "⌛ Lobby expired — nobody started the match. Use /pvp to try again.")
+                await self.close_invites("⌛ This lobby expired.")
                 await manager.close(self)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("lobby expiry failed")
 
-    def start(self) -> None:
+    # ------------------------------------------------------------- starting
+    async def start(self) -> None:
+        if self.status != "lobby":  # (sync check first: guards against double clicks)
+            return
         self.status = "running"
         if self.lobby_task and not self.lobby_task.done():
             self.lobby_task.cancel()
-        self.task = asyncio.create_task(self._run())
-
-    # ------------------------------------------------------------- match loop
-    async def _run(self) -> None:
-        try:
-            await self._play()
-        except asyncio.CancelledError:
-            raise
-        except TelegramForbiddenError:
-            log.warning("Bot lost access to chat %s", self.chat_id)
-        except Exception:
-            log.exception("Match crashed in chat %s", self.chat_id)
-            try:
-                await self.send("⚠️ Something went wrong — match aborted. No stats were recorded.")
-            except Exception:
-                pass
-        finally:
-            await manager.close(self)
-
-    async def _play(self) -> None:
         self.started_at = datetime.now(timezone.utc)
-        names = ", ".join(mention(p.id, p.name) for p in self.players.values())
-        await self.edit(self.lobby_msg_id, f"🚀 <b>Match started!</b>\n{self.emoji} {self.game_name} · {self.config_line()}\n👥 {names}")
-        for target in list(self.invite_msgs):
-            await self.set_invite_result(target, "⌛ Invite closed — the match has started.")
+        self.round_no, self.tiebreaks, self.turn_idx = 1, 0, 0
+        self.participants = list(self.players.values())
+        for p in self.players.values():
+            p.round_rolls = []
+        names = ", ".join(esc(p.name) for p in self.players.values())
+        await self.close_invites("⌛ Invite closed — the match has started.")
+        await self.edit(self.lobby_msg_id,
+                        f"🚀 <b>Match started!</b>\n{self.emoji} {self.game_name} · {self.config_line()}\n👥 {names}")
+        async with self.lock:
+            await self._announce()
 
-        while True:
-            self.round_no += 1
-            self.participants = list(self.players.values())
-            tie = 0
-            while True:
-                for p in self.players.values():
-                    p.round_rolls, p.done = [], False
-                self.board_header = f"Round {self.round_no}" + (f" · Tie-break #{tie}" if tie else "")
-                await self._update_board(repost=True)
-
-                for p in self.participants:
-                    await self._take_turn(p)
-
-                winners = self._round_winners()
-                if len(winners) == 1:
-                    break
-                tie += 1
-                self.participants = winners
-                self.last_note = ("🤝 Tie between " + ", ".join(mention(w.id, w.name) for w in winners)
-                                  + " — tie-break throw!")
-                await asyncio.sleep(3)
-
-            winner = winners[0]
-            winner.series_wins += 1
-            if winner.series_wins >= self.target_wins:
-                self.last_note = f"🏆 {mention(winner.id, winner.name)} wins round {self.round_no} and the match!"
-                await self._update_board()
-                await self._finish(winner)
+    # ------------------------------------------------------------- dice handling (the fast path)
+    async def handle_dice(self, uid: int, emoji: str, value: int, msg_date) -> None:
+        if self.status != "running" or uid not in self.players:
+            return
+        async with self.lock:
+            if self.status != "running":
                 return
-            self.last_note = f"✅ Round {self.round_no} → {mention(winner.id, winner.name)} (+1 series win)"
-            await self._update_board()
-            await asyncio.sleep(5)
+            cur = self.current_player()
+            if uid != cur.id:
+                return await self._warn(uid, f"⛔️ {esc(self.players[uid].name)}, it's {esc(cur.name)}'s turn.")
+            if emoji.replace(VS, "") != self.emoji.replace(VS, ""):
+                return await self._warn(uid, f"⚠️ {esc(cur.name)}, send {self.emoji} (not {emoji}).")
+            if self.turn_started is not None and msg_date < self.turn_started:
+                return  # thrown before this turn began
+            if len(cur.round_rolls) >= self.rolls:
+                return
+            await self._apply_roll(cur, value)
+
+    async def _warn(self, uid: int, text: str) -> None:
+        now = time.monotonic()
+        if now - self.warned.get(uid, 0) < WARN_COOLDOWN:
+            return
+        self.warned[uid] = now
+        try:
+            await self.send(text)
+        except Exception:
+            pass
+
+    async def _apply_roll(self, p: Player, value: int, auto: bool = False) -> None:
+        p.round_rolls.append(value)
+        p.total_points += value
+        self.persist()
+        if len(p.round_rolls) >= self.rolls:
+            await self._complete_turn(p, auto)
+        else:
+            self._arm_timer()
+
+    async def _complete_turn(self, p: Player, auto: bool) -> None:
+        line = f"{self.emoji} {esc(p.name)} rolled <b>{sum(p.round_rolls)}</b>"
+        if self.rolls > 1:
+            line += " (" + " + ".join(map(str, p.round_rolls)) + ")"
+        if auto:
+            line += " ⏰"
+
+        self.turn_idx += 1
+        if self.turn_idx < len(self.participants):
+            return await self._announce(line)
+
+        # ---- everyone has thrown: decide the round
+        winners = self._round_winners()
+        if len(winners) > 1:  # tie -> tie-break between the tied players only
+            self.tiebreaks += 1
+            self.participants, self.turn_idx = winners, 0
+            for w in winners:
+                w.round_rolls = []
+            names = ", ".join(esc(w.name) for w in winners)
+            return await self._announce(
+                f"{line}\n🤝 Round {self.round_no} tied: {names}\nTie-break throw!", blank=True)
+
+        w = winners[0]
+        w.series_wins += 1
+        head = f"{line}\n👑 Round {self.round_no} to {esc(w.name)}"
+        if w.series_wins >= self.target_wins:
+            return await self._finish(w, head)
+        self.round_no += 1
+        self.tiebreaks, self.turn_idx = 0, 0
+        self.participants = list(self.players.values())  # same order every round
+        for q in self.participants:
+            q.round_rolls = []
+        await self._announce(f"{head}\n{self.standings()}", blank=True)
 
     def _round_winners(self) -> list[Player]:
         totals = {p.id: sum(p.round_rolls) for p in self.participants}
         best = (min if self.mode == "crazy" else max)(totals.values())
         return [p for p in self.participants if totals[p.id] == best]
 
-    def submit_roll(self, uid: int, emoji: str, value: int, msg_date) -> bool:
-        """Called when a player sends their own dice emoji in the group."""
-        if self.status != "running" or self.current_turn != uid:
-            return False
-        if emoji.replace("\ufe0f", "") != self.emoji.replace("\ufe0f", ""):
-            return False
-        if self.turn_date is not None and msg_date < self.turn_date:
-            return False  # sent before the turn started
-        p = self.players.get(uid)
-        if p is None or len(p.round_rolls) >= self.rolls:
-            return False
-        p.round_rolls.append(value)
-        p.total_points += value
-        self.roll_event.set()
-        return True
-
-    def request_bot_throw(self) -> None:
-        self.bot_throw = True
-        self.roll_event.set()
-
-    async def _take_turn(self, p: Player) -> None:
-        self.current_turn = p.id
-        self.bot_throw = False
-        self.roll_event.clear()
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🤖 Bot, throw for me", callback_data="throw")]])
-        who = mention(p.id, p.name)
-        msg = await self.send(
-            f"{self.emoji} {who}, it's your turn! ({self.board_header})\n"
-            f"👉 Send the {self.emoji} emoji yourself — {self.rolls} throw(s) needed.\n"
-            f"⏰ No throw within {TURN_TIMEOUT}s → I'll throw for you.",
-            reply_markup=kb)
-        self.turn_msg_id = msg.message_id
-        self.turn_date = msg.date
-
-        def rolls_text() -> str:
-            return f"Rolls: {' '.join(map(str, p.round_rolls))} → <b>{sum(p.round_rolls)}</b>"
-
-        auto = False
-        while len(p.round_rolls) < self.rolls and not self.bot_throw:
-            self.roll_event.clear()
-            try:
-                await asyncio.wait_for(self.roll_event.wait(), TURN_TIMEOUT)
-            except asyncio.TimeoutError:
-                auto = True
-                break
-            if not self.bot_throw and p.round_rolls:
-                await asyncio.sleep(3.5)  # let the player's dice animation finish (no spoilers)
-                await self.edit(msg.message_id, f"{self.emoji} {who}\n{rolls_text()}", kb)
-        self.current_turn = None
-
-        head = f"{self.emoji} {who}" + (" ⏰ (auto-throw)" if auto else "")
-        remaining = self.rolls - len(p.round_rolls)
-        if remaining > 0:
-            await self.edit(msg.message_id, f"{head} — 🤖 throwing {remaining} for you…")
-            kw = {"message_thread_id": self.thread_id} if self.thread_id else {}
-            for _ in range(remaining):
-                dm = await self._call(self.bot.send_dice, self.chat_id, emoji=self.emoji, **kw)
-                value = dm.dice.value
-                p.round_rolls.append(value)
-                p.total_points += value
-                await asyncio.sleep(ANIM_DELAY)
-                await self.edit(msg.message_id, f"{head}\n{rolls_text()}")
-        else:
-            await asyncio.sleep(ANIM_DELAY)
-            await self.edit(msg.message_id, f"{head}\n{rolls_text()}")
-        p.done = True
-        await self._update_board()
-
-    # ------------------------------------------------------------- invites (private when possible)
-    async def send_invite(self, target: str, uid: Optional[int]) -> str:
-        """Send invite. Returns 'private' (ephemeral, only the target sees it) or 'public'."""
-        await self.set_invite_result(target, None)  # drop an older invite for a resend
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Join", callback_data=InviteCB(action="yes", chat_id=self.chat_id, target=target).pack()),
-            InlineKeyboardButton(text="❌ Decline", callback_data=InviteCB(action="no", chat_id=self.chat_id, target=target).pack()),
-        ]])
-        text = (f"👋 {self.invited[target]}, {mention(self.creator_id, self.creator_name)} invited you to a "
-                f"{self.emoji} <b>{self.game_name}</b> PvP match!\n⚙️ {self.config_line()}")
-        if uid is not None and EphemeralMessageParameters is not None:
-            try:
-                m = await self.send(text, reply_markup=kb,
-                                    ephemeral_message_parameters=EphemeralMessageParameters(receiver_user_id=uid))
-                eid = getattr(m, "ephemeral_message_id", None)
-                if eid is not None:
-                    self.invite_msgs[target] = ("eph", eid, uid)
-                    return "private"
-                self.invite_msgs[target] = ("eph", None, uid)
-                return "private"
-            except Exception as e:
-                log.warning("Ephemeral invite failed (%s) - falling back to a public invite", e)
-        m = await self.send(text, reply_markup=kb)
-        self.invite_msgs[target] = ("pub", m.message_id)
-        return "public"
-
-    async def set_invite_result(self, target: str, text: Optional[str]) -> None:
-        """Replace the invite message with `text` (or just delete it when text is None)."""
-        ref = self.invite_msgs.pop(target, None)
-        if not ref:
-            return
+    async def _announce(self, head: str = "", blank: bool = False) -> None:
+        text = self.prompt() if not head else head + ("\n\n" if blank else "\n") + self.prompt()
+        self.persist()
         try:
-            if ref[0] == "eph":
-                if ref[1] is None:
-                    return
-                if text is None:
-                    await self.bot.delete_ephemeral_message(
-                        chat_id=self.chat_id, receiver_user_id=ref[2], ephemeral_message_id=ref[1])
-                else:
-                    await self.bot.edit_ephemeral_message_text(
-                        chat_id=self.chat_id, receiver_user_id=ref[2], ephemeral_message_id=ref[1],
-                        text=text, parse_mode="HTML")
-            elif text is None:
-                await self.delete(ref[1])
-            else:
-                await self.edit(ref[1], text)
-        except Exception as e:
-            log.debug("set_invite_result failed: %s", e)
-
-    # ------------------------------------------------------------- scoreboard
-    def _score_str(self, p: Player) -> str:
-        if p not in self.participants:
-            return "— (out)"
-        if not p.done:
-            return "⏳"
-        return f"<b>{sum(p.round_rolls)}</b> ({'+'.join(map(str, p.round_rolls))})"
-
-    def board_text(self) -> str:
-        lines = [
-            f"{self.emoji} <b>{self.game_name}</b> · {self.mode_label} · {self.rolls} roll(s)",
-            f"🎯 First to <b>{self.target_wins}</b> series win(s)",
-            "",
-            f"📋 <b>{self.board_header}</b>",
-        ]
-        for p in self.players.values():
-            lines.append(f"• {mention(p.id, p.name)}: {self._score_str(p)}  |  🏅 {p.series_wins}/{self.target_wins}")
-        if self.last_note:
-            lines += ["", self.last_note]
-        return "\n".join(lines)
-
-    async def _update_board(self, repost: bool = False) -> None:
-        text = self.board_text()
-        if repost or self.board_msg_id is None:
-            old = self.board_msg_id
             msg = await self.send(text)
-            self.board_msg_id = msg.message_id
-            await self.delete(old)
-        else:
-            await self.edit(self.board_msg_id, text)
+            self.turn_started = msg.date
+        finally:
+            self._arm_timer()
+
+    # ------------------------------------------------------------- AFK handling (bot throws after 60s)
+    def _arm_timer(self) -> None:
+        self.timer_token += 1
+        old = self.timer
+        if old and not old.done() and old is not asyncio.current_task():
+            old.cancel()
+        if self.status == "running":
+            self.timer = asyncio.create_task(self._watchdog(self.timer_token))
+
+    def _stop_timer(self) -> None:
+        self.timer_token += 1
+        if self.timer and not self.timer.done() and self.timer is not asyncio.current_task():
+            self.timer.cancel()
+
+    async def _watchdog(self, token: int) -> None:
+        try:
+            await asyncio.sleep(TURN_TIMEOUT)
+            async with self.lock:
+                if token != self.timer_token or self.status != "running":
+                    return
+                await self._bot_throw_current()
+        except asyncio.CancelledError:
+            raise
+        except TelegramForbiddenError:
+            log.warning("Bot lost access to chat %s", self.chat_id)
+        except Exception:
+            log.exception("watchdog failed in chat %s", self.chat_id)
+            self._arm_timer()  # try again later instead of freezing the match
+
+    async def _bot_throw_current(self) -> None:
+        p = self.current_player()
+        await self.send(f"⏰ {esc(p.name)} didn't throw in {TURN_TIMEOUT}s — I'll throw for them.")
+        kw = {"message_thread_id": self.thread_id} if self.thread_id else {}
+        while self.status == "running" and self.current_player() is p and len(p.round_rolls) < self.rolls:
+            dm = await self._call(self.bot.send_dice, self.chat_id, emoji=self.emoji, **kw)
+            await self._apply_roll(p, dm.dice.value, auto=True)
+            if self.status == "running" and self.current_player() is p:
+                await asyncio.sleep(BOT_ROLL_GAP)
+
+    # ------------------------------------------------------------- persistence (resume after redeploy)
+    def snapshot(self) -> dict:
+        return {
+            "_id": self.chat_id, "thread_id": self.thread_id, "chat_title": self.chat_title,
+            "creator_id": self.creator_id, "creator_name": self.creator_name,
+            "game": self.game, "mode": self.mode, "rolls": self.rolls, "target_wins": self.target_wins,
+            "round_no": self.round_no, "turn_idx": self.turn_idx, "tiebreaks": self.tiebreaks,
+            "participants": [p.id for p in self.participants],
+            "players": [{"id": p.id, "name": p.name, "series_wins": p.series_wins,
+                         "total_points": p.total_points, "round_rolls": list(p.round_rolls)}
+                        for p in self.players.values()],
+            "started_at": self.started_at, "updated_at": datetime.now(timezone.utc),
+        }
+
+    @classmethod
+    def from_snapshot(cls, bot: Bot, s: dict) -> "GameSession":
+        obj = cls(bot, s["_id"], s.get("thread_id"), s.get("chat_title", ""), s["creator_id"],
+                  s["creator_name"], s["game"], s["mode"], s["rolls"], s["target_wins"])
+        obj.players = {pl["id"]: Player(pl["id"], pl["name"], pl["series_wins"], pl["total_points"],
+                                        list(pl["round_rolls"])) for pl in s["players"]}
+        obj.participants = [obj.players[i] for i in s["participants"]]
+        obj.round_no, obj.turn_idx, obj.tiebreaks = s["round_no"], s["turn_idx"], s.get("tiebreaks", 0)
+        obj.started_at = s.get("started_at")
+        obj.status = "running"
+        return obj
+
+    def persist(self) -> None:
+        """Save the state in the background (coalesced) - never slows the dice path down."""
+        if self.status != "running":
+            return
+        self._dirty = True
+        if self._saver is None or self._saver.done():
+            self._saver = asyncio.create_task(self._save_loop())
+
+    async def _save_loop(self) -> None:
+        while self._dirty and self.status == "running":
+            self._dirty = False
+            try:
+                await database.save_active(self.snapshot())
+            except Exception:
+                log.exception("saving match state failed")
+                await asyncio.sleep(2)
+                self._dirty = True
+
+    async def resume(self) -> None:
+        async with self.lock:
+            await self._announce(f"🔄 Bot is back — match resumed · Round {self.round_no}\n{self.standings()}",
+                                 blank=True)
 
     # ------------------------------------------------------------- finish
-    async def _finish(self, winner: Player) -> None:
+    async def _finish(self, winner: Player, head: str) -> None:
+        self.status = "finished"
+        self._stop_timer()
         crazy = self.mode == "crazy"
         ranking = sorted(self.players.values(),
                          key=lambda p: (-p.series_wins, p.total_points if crazy else -p.total_points))
-        saved = True
+        saved = False
+        for _ in range(3):
+            try:
+                await database.record_match(
+                    chat_id=self.chat_id, chat_title=self.chat_title, game=self.game, mode=self.mode,
+                    rolls=self.rolls, target_wins=self.target_wins, started_at=self.started_at,
+                    winner_id=winner.id, winner_name=winner.name,
+                    players=[database.PlayerResult(p.id, p.name, p.series_wins, p.total_points) for p in ranking])
+                saved = True
+                break
+            except Exception:
+                log.exception("record_match failed")
+                await asyncio.sleep(1)
+        if self._saver and not self._saver.done():
+            try:
+                await self._saver
+            except Exception:
+                pass
         try:
-            await database.record_match(
-                chat_id=self.chat_id, chat_title=self.chat_title, game=self.game, mode=self.mode,
-                rolls=self.rolls, target_wins=self.target_wins, started_at=self.started_at,
-                winner_id=winner.id, winner_name=winner.name,
-                players=[database.PlayerResult(p.id, p.name, p.series_wins, p.total_points) for p in ranking],
-            )
+            await database.delete_active(self.chat_id)
         except Exception:
-            saved = False
-            log.exception("Failed to save match")
+            log.exception("delete_active failed")
 
-        lines = [f"🏆 <b>MATCH OVER!</b> 🏆", f"Winner: {mention(winner.id, winner.name)} 🎉", "", "<b>Final standings:</b>"]
-        for i, p in enumerate(ranking):
-            lines.append(f"{MEDALS[i] if i < 3 else '▫️'} {mention(p.id, p.name)} — "
-                         f"{p.series_wins} series win(s) · {p.total_points} pts")
-        lines += ["", "💾 Stats saved. Check /stats, /top, /history." if saved else "⚠️ Could not save stats (see server logs)."]
-        await self.send("\n".join(lines))
+        lines = [head, f"🏆 <b>{esc(winner.name)} won the match!</b>"]
+        lines += [f"{MEDALS[i] if i < 3 else '▫️'} {esc(p.name)} - {p.series_wins}" for i, p in enumerate(ranking)]
+        if not saved:
+            lines += ["", "⚠️ Could not save stats (see server logs)."]
+        try:
+            await self.send("\n".join(lines))
+        finally:
+            await manager.close(self)
 
 
 class SessionManager:
@@ -489,25 +567,56 @@ class SessionManager:
         if self.sessions.get(session.chat_id) is not session:
             return
         del self.sessions[session.chat_id]
-        session.status = "closed"
-        me = asyncio.current_task()
-        for t in (session.lobby_task, session.task):
-            if t and t is not me and not t.done():
-                t.cancel()
+        if session.status in ("lobby", "running"):
+            session.status = "closed"
+        session._stop_timer()
+        if session.lobby_task and not session.lobby_task.done() and session.lobby_task is not asyncio.current_task():
+            session.lobby_task.cancel()
         if session.on_close:
             try:
                 await session.on_close()
             except Exception:
                 log.exception("on_close failed")
 
-    async def shutdown(self, bot: Bot) -> None:
-        for s in list(self.sessions.values()):
+    async def restore_all(self, bot: Bot) -> None:
+        """On start-up: continue every match that was running when the bot stopped."""
+        try:
+            docs = await database.load_active()
+        except Exception:
+            log.exception("could not load saved matches")
+            return
+        for snap in docs:
+            chat_id = snap.get("_id")
             try:
-                await s.send("🔄 Bot is restarting — the current match was cancelled. "
-                             "Your saved stats are safe. Use /pvp to start again.")
+                s = GameSession.from_snapshot(bot, snap)
+                self.sessions[s.chat_id] = s
+                await s.resume()
+                log.info("Resumed match in chat %s", chat_id)
+            except (TelegramForbiddenError, TelegramBadRequest) as e:
+                log.warning("Dropping saved match for chat %s: %s", chat_id, e)
+                self.sessions.pop(chat_id, None)
+                await database.delete_active(chat_id)
             except Exception:
-                pass
-            await self.close(s)
+                log.exception("Could not resume match in chat %s", chat_id)
+                self.sessions.pop(chat_id, None)
+
+    async def shutdown(self, bot: Bot) -> None:
+        """Graceful stop (redeploy): running matches are SAVED, not cancelled."""
+        for s in list(self.sessions.values()):
+            if s.status == "running":
+                s._stop_timer()
+                try:
+                    await database.save_active(s.snapshot())
+                except Exception:
+                    log.exception("final save failed")
+                try:
+                    await s.send("🔄 Bot is restarting — your match is saved and will continue automatically.")
+                except Exception:
+                    pass
+            elif s.status == "lobby":
+                await s.edit(s.lobby_msg_id, "⚠️ Bot restarted — this lobby was closed. Use /pvp to start again.")
+                await s.close_invites("⌛ This lobby was closed.")
+        self.sessions.clear()
 
 
 manager = SessionManager()
