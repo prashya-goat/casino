@@ -9,6 +9,7 @@
 import asyncio
 import html
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,6 +36,10 @@ SETUP_TIMEOUT = 300    # seconds before an abandoned setup wizard frees the chat
 TURN_TIMEOUT = 60      # seconds without a throw before the bot throws for the player
 BOT_ROLL_GAP = 1.5     # pause between the bot's own throws (flood-control friendly)
 WARN_COOLDOWN = 10     # max one "wrong turn" warning per player per N seconds
+# Abandoned matches: nobody throws while the bot keeps auto-throwing -> the match is dropped (no stats).
+AUTO_TURN_LIMIT = int(os.getenv("AUTO_TURN_LIMIT", "5"))
+# After a restart, only matches with a real player throw this recent are resumed; older ones are deleted.
+RESUME_WINDOW = int(os.getenv("RESUME_WINDOW_MINUTES", "30")) * 60
 VS = "\ufe0f"
 
 GAMES = {
@@ -103,6 +108,8 @@ class GameSession:
         self.participants: list[Player] = []
 
         self.turn_started: Optional[datetime] = None
+        self.last_activity = datetime.now(timezone.utc)   # last throw made by a REAL player
+        self.auto_streak = 0                              # consecutive turns thrown by the bot
         self.lock = asyncio.Lock()
         self.warned: dict[int, float] = {}
         self.timer: Optional[asyncio.Task] = None
@@ -309,7 +316,7 @@ class GameSession:
         self.status = "running"
         if self.lobby_task and not self.lobby_task.done():
             self.lobby_task.cancel()
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = self.last_activity = datetime.now(timezone.utc)
         self.round_no, self.tiebreaks, self.turn_idx = 1, 0, 0
         self.participants = list(self.players.values())
         for p in self.players.values():
@@ -337,6 +344,7 @@ class GameSession:
                 return  # thrown before this turn began
             if len(cur.round_rolls) >= self.rolls:
                 return
+            self.last_activity, self.auto_streak = datetime.now(timezone.utc), 0   # a real player is here
             await self._apply_roll(cur, value)
 
     async def _warn(self, uid: int, text: str) -> None:
@@ -436,6 +444,9 @@ class GameSession:
             self._arm_timer()  # try again later instead of freezing the match
 
     async def _bot_throw_current(self) -> None:
+        self.auto_streak += 1
+        if self.auto_streak > AUTO_TURN_LIMIT:   # nobody is playing any more
+            return await self._abandon()
         p = self.current_player()
         await self.send(f"⏰ {esc(p.name)} didn't throw in {TURN_TIMEOUT}s — I'll throw for them.")
         kw = {"message_thread_id": self.thread_id} if self.thread_id else {}
@@ -456,7 +467,8 @@ class GameSession:
             "players": [{"id": p.id, "name": p.name, "series_wins": p.series_wins,
                          "total_points": p.total_points, "round_rolls": list(p.round_rolls)}
                         for p in self.players.values()],
-            "started_at": self.started_at, "updated_at": datetime.now(timezone.utc),
+            "started_at": self.started_at, "last_activity": self.last_activity,
+            "updated_at": datetime.now(timezone.utc),
         }
 
     @classmethod
@@ -468,6 +480,9 @@ class GameSession:
         obj.participants = [obj.players[i] for i in s["participants"]]
         obj.round_no, obj.turn_idx, obj.tiebreaks = s["round_no"], s["turn_idx"], s.get("tiebreaks", 0)
         obj.started_at = s.get("started_at")
+        la = s.get("last_activity")
+        if la is not None:
+            obj.last_activity = la if la.tzinfo else la.replace(tzinfo=timezone.utc)
         obj.status = "running"
         return obj
 
@@ -493,6 +508,27 @@ class GameSession:
         async with self.lock:
             await self._announce(f"🔄 Bot is back — match resumed · Round {self.round_no}\n{self.standings()}",
                                  blank=True)
+
+    async def _abandon(self) -> None:
+        """Nobody has played for a while: drop the match (no stats) instead of auto-playing it forever."""
+        self.status = "abandoned"
+        self._stop_timer()
+        if self._saver and not self._saver.done():
+            try:
+                await self._saver
+            except Exception:
+                pass
+        try:
+            await database.delete_active(self.chat_id)
+        except Exception:
+            log.exception("delete_active failed")
+        try:
+            await self.send("⌛ Nobody played for a while, so this match was abandoned (no stats recorded). "
+                            "Use /pvp to start a new one.")
+        except Exception:
+            pass
+        finally:
+            await manager.close(self)
 
     # ------------------------------------------------------------- finish
     async def _finish(self, winner: Player, head: str) -> None:
@@ -587,6 +623,16 @@ class SessionManager:
             return
         for snap in docs:
             chat_id = snap.get("_id")
+            la = snap.get("last_activity")   # saved matches without it are old-format => treated as stale
+            if la is not None and la.tzinfo is None:
+                la = la.replace(tzinfo=timezone.utc)
+            if la is None or (datetime.now(timezone.utc) - la).total_seconds() > RESUME_WINDOW:
+                log.info("Dropping stale saved match in chat %s (no player activity recently)", chat_id)
+                try:
+                    await database.delete_active(chat_id)
+                except Exception:
+                    log.exception("could not delete stale match")
+                continue
             try:
                 s = GameSession.from_snapshot(bot, snap)
                 self.sessions[s.chat_id] = s
