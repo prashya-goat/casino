@@ -4,7 +4,7 @@
 * Players send the game emoji themselves; every dice is counted the moment it arrives.
 * The full match state is saved to MongoDB after every roll, so a redeploy/restart
   resumes the match exactly where it stopped (see SessionManager.restore_all).
-* A started match cannot be stopped.
+* A started match cannot be stopped. -> (Ab creator /admin /stop command se rok sakta hai)
 """
 import asyncio
 import html
@@ -224,7 +224,7 @@ class GameSession:
             "➕ <b>Invite</b> (creator only): <code>/invite @username</code>, or reply to a player with /invite.",
             "Only the invited player (and you) can see the invite.",
             f"Need {MIN_PLAYERS}–{MAX_PLAYERS} players, then press ▶️ Start. "
-            "<b>A started match cannot be stopped.</b>",
+            "Use /stop to cancel or stop the game.",
         ]
         return "\n".join(lines)
 
@@ -327,6 +327,27 @@ class GameSession:
                         f"🚀 <b>Match started!</b>\n{self.emoji} {self.game_name} · {self.config_line()}\n👥 {names}")
         async with self.lock:
             await self._announce()
+
+    # ------------------------------------------------------------- stop game by creator/admin
+    async def stop(self) -> None:
+        """Stops the active match or lobby when /stop is invoked."""
+        self.status = "stopped"
+        self._stop_timer()
+        if self._saver and not self._saver.done():
+            try:
+                await self._saver
+            except Exception:
+                pass
+        try:
+            await database.delete_active(self.chat_id)
+        except Exception:
+            log.exception("delete_active failed on stop")
+        try:
+            await self.send("🛑 <b>Match stopped</b> by the game creator or admin. Use /pvp to start a new game.")
+        except Exception:
+            pass
+        finally:
+            await manager.close(self)
 
     # ------------------------------------------------------------- dice handling (the fast path)
     async def handle_dice(self, uid: int, emoji: str, value: int, msg_date) -> None:
