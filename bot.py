@@ -20,8 +20,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 import database
-from game import (GAMES, MAX_PLAYERS, MIN_PLAYERS, MODES, GameSession, InviteCB, lobby_markup,
-                  manager, mention)
+from game import (GAMES, MAX_PLAYERS, MEDALS, MIN_PLAYERS, MODES, STAKES, GameSession, InviteCB, btn,
+                  lobby_markup, manager, mention, money, money_signed)
 
 log = logging.getLogger("pvp.bot")
 router = Router()
@@ -35,29 +35,31 @@ class PvP(StatesGroup):
     choosing_mode = State()
     choosing_rolls = State()
     choosing_wins = State()
+    choosing_stake = State()
     inviting = State()
     in_match = State()
 
 
 class SetupCB(CallbackData, prefix="su"):
-    step: str       # game | mode | rolls | wins | back | cancel
+    step: str       # game | mode | rolls | wins | stake | back | cancel
     value: str = ""
 
 
 STATE_OF = {"game": PvP.choosing_game, "mode": PvP.choosing_mode,
-            "rolls": PvP.choosing_rolls, "wins": PvP.choosing_wins}
+            "rolls": PvP.choosing_rolls, "wins": PvP.choosing_wins, "stake": PvP.choosing_stake}
 STEP_OF_STATE = {st.state: step for step, st in STATE_OF.items()}
 SETUP_STATES = tuple(STATE_OF.values())
-ORDER = ["game", "mode", "rolls", "wins"]
+ORDER = ["game", "mode", "rolls", "wins", "stake"]
 QUESTIONS = {
     "game": "Which game?",
     "mode": "Which mode?\nNormal — highest total wins\nCrazy — lowest total wins",
     "rolls": "How many rolls per round?",
     "wins": "First to how many wins?",
+    "stake": "How much is each player playing for?\n(virtual money — just for fun & stats, nothing real)",
 }
 
 
-# ============================================================ wizard views (casino style vertical layout with emojis)
+# ============================================================ wizard views (exact layouts)
 def setup_header(d: dict) -> str:
     lines = [f"⚔️ {mention(d['creator_id'], d['creator_name'])} is setting up a PvP match"]
     if "game" in d:
@@ -70,6 +72,8 @@ def setup_header(d: dict) -> str:
         parts.append(f"{d['rolls']} roll(s)")
     if "wins" in d:
         parts.append(f"first to {d['wins']}")
+    if "stake" in d:
+        parts.append(f"💰 {money(d['stake'])}" if d["stake"] else "🆓 Free play")
     if parts:
         lines.append(" · ".join(parts))
     return "\n".join(lines)
@@ -78,38 +82,33 @@ def setup_header(d: dict) -> str:
 def step_view(step: str, d: dict) -> tuple[str, InlineKeyboardMarkup]:
     text = setup_header(d) + f"\n\n<blockquote>{QUESTIONS[step]}</blockquote>"
     b = InlineKeyboardBuilder()
-    
-    # Game selection (Grid style as requested previously)
-    if step == "game":      
+    if step == "game":      # [🎲][🏀] / [⚽][🎳] / [🎯] / [❌ Cancel]
         for key, (emoji, name) in GAMES.items():
-            b.button(text=f"{emoji} {name}", callback_data=SetupCB(step="game", value=key))
-        b.button(text="❌ Cancel", callback_data=SetupCB(step="cancel"))
+            b.add(btn(f"{emoji} {name}", SetupCB(step="game", value=key).pack(), "primary"))
+        b.add(btn("❌ Cancel", SetupCB(step="cancel").pack(), "danger"))
         b.adjust(2, 2, 1, 1)
-        
-    # Mode selection (Vertical list)
-    elif step == "mode":    
-        b.button(text="🟢 Normal Mode", callback_data=SetupCB(step="mode", value="normal"))
-        b.button(text="🔴 Crazy Mode", callback_data=SetupCB(step="mode", value="crazy"))
-        b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(1, 1, 1)
-        
-    # Rolls selection (Vertical stack with game emojis like 🏀 1 Roll)
-    elif step == "rolls":   
-        emoji = GAMES.get(d.get("game", "dice"), ("🎲",))[0]
+    elif step == "mode":    # one button per row, full width
+        b.add(btn("🟢 Normal Mode", SetupCB(step="mode", value="normal").pack(), "success"))
+        b.add(btn("🔴 Crazy Mode", SetupCB(step="mode", value="crazy").pack(), "danger"))
+        b.add(btn("« Back", SetupCB(step="back").pack()))
+        b.adjust(1, repeat=True)
+    elif step == "rolls":   # 1 Roll / 2 Rolls ... (full width, uses the chosen game's emoji)
+        emoji = GAMES[d["game"]][0]
         for n in range(1, 11):
-            label = f"{emoji} {n} Roll{'s' if n > 1 else ''}"
-            b.button(text=label, callback_data=SetupCB(step="rolls", value=str(n)))
-        b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(*(1 for _ in range(12))) # Har row mein ek button (vertical stack)
-        
-    # Wins selection (Vertical stack with clean numbering)
-    elif step == "wins":    
+            b.add(btn(f"{emoji} {n} Roll{'s' if n > 1 else ''}", SetupCB(step="rolls", value=str(n)).pack(), "primary"))
+        b.add(btn("« Back", SetupCB(step="back").pack()))
+        b.adjust(1, repeat=True)
+    elif step == "wins":    # 🏆 1 Win / 🏆 2 Wins ... (full width)
         for n in range(1, 21):
-            label = f"🏆 {n} Win{'s' if n > 1 else ''}"
-            b.button(text=label, callback_data=SetupCB(step="wins", value=str(n)))
-        b.button(text="« Back", callback_data=SetupCB(step="back"))
-        b.adjust(*(1 for _ in range(22))) # Har row mein ek button (vertical stack)
-        
+            b.add(btn(f"🏆 {n} Win{'s' if n > 1 else ''}", SetupCB(step="wins", value=str(n)).pack(), "primary"))
+        b.add(btn("« Back", SetupCB(step="back").pack()))
+        b.adjust(1, repeat=True)
+    elif step == "stake":   # [Free] / 2 per row / [Back]
+        for c in STAKES:
+            b.add(btn("🆓 Free play" if c == 0 else f"💰 {money(c)}", SetupCB(step="stake", value=str(c)).pack(),
+                      "success" if c == 0 else "primary"))
+        b.add(btn("« Back", SetupCB(step="back").pack()))
+        b.adjust(1, 2, 2, 2, 2, 1, 1)
     return text, b.as_markup()
 
 
@@ -118,12 +117,17 @@ def validate(step: str, value: str) -> Any:
         return value if value in GAMES else None
     if step == "mode":
         return value if value in MODES else None
+    if step == "stake":
+        return int(value) if value.isdigit() and int(value) in STAKES else None
     hi = 10 if step == "rolls" else 20
     return int(value) if value.isdigit() and 1 <= int(value) <= hi else None
 
 
 # ============================================================ RAM-only username memory
 class SeenUsers(BaseMiddleware):
+    """RAM-only memory of recent (chat, @username) -> user id, so `/invite @user` can find the id.
+    Never written to disk or the database; cleared on every restart."""
+
     MAX = 5000
 
     def __init__(self) -> None:
@@ -155,7 +159,8 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     return m.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
 
 
-def extract_targets(message: Message) -> tuple[dict[int, str], list[str]]:
+def extract_targets(message: Message, bot_username: str = "") -> tuple[dict[int, str], list[str]]:
+    """Reply / text_mention / @username -> ({user_id: name}, [usernames we couldn't resolve])."""
     me = message.from_user.id if message.from_user else 0
     targets: dict[int, str] = {}
     unknown: list[str] = []
@@ -167,6 +172,8 @@ def extract_targets(message: Message) -> tuple[dict[int, str], list[str]]:
             targets[ent.user.id] = ent.user.full_name
         elif ent.type == MessageEntityType.MENTION:
             uname = ent.extract_from(message.text)[1:]
+            if uname.lower() == bot_username.lower():
+                continue
             hit = seen.lookup(message.chat.id, uname)
             if hit is None:
                 unknown.append(uname)
@@ -179,9 +186,10 @@ def extract_targets(message: Message) -> tuple[dict[int, str], list[str]]:
 HELP = (
     "🎮 <b>PvP Games Bot</b>\n\n"
     "/pvp — set up a match in a group (2–7 players)\n"
-    "/invite @username — invite a player (or reply to them with /invite)\n"
+    "/invite @username — invite a player (or just type @username as the lobby creator, or reply with /invite)\n"
     "/stats · /top · /history — your stats, leaderboard, last matches\n\n"
-    "On your turn, send the game emoji yourself (🎲 🏀 ⚽ 🎳 🎯). Don't throw within 60s and I throw for you.\n"
+    "On your turn, send the game emoji yourself (🎲 🏀 ⚽ 🎳 🎯). If I'm not an admin, reply to my message with it "
+    "or tap the button. No throw within 60s (I warn you at 30s) and I throw for you.\n"
     "⚠️ Once a match has started it can't be stopped."
 )
 
@@ -200,7 +208,7 @@ async def cmd_pvp_private(message: Message) -> None:
 @router.message(Command("pvp"), GROUP)
 async def cmd_pvp(message: Message, state: FSMContext) -> None:
     user = message.from_user
-    if user is None or user.is_bot:
+    if user is None or user.is_bot:  # anonymous admin posts can't be tracked
         return await message.reply("⚠️ Please turn off anonymous-admin mode to start a match.")
     chat_id = message.chat.id
     if manager.get(chat_id):
@@ -214,7 +222,7 @@ async def cmd_pvp(message: Message, state: FSMContext) -> None:
     await state.set_data(d)
     await state.set_state(PvP.choosing_game)
     text, kb = step_view("game", d)
-    await message.reply(text, reply_markup=kb)
+    await message.reply(text, reply_markup=kb)  # reply => the /pvp command is quoted above the wizard
 
 
 async def goto(msg: Message, state: FSMContext, step: str) -> None:
@@ -233,12 +241,13 @@ async def open_lobby(msg: Message, state: FSMContext, d: dict) -> None:
         await state.clear()
         return await msg.edit_text("⚠️ A match already exists in this group.")
     s = GameSession(msg.bot, chat_id, d.get("thread_id"), d.get("title", ""), d["creator_id"],
-                    d["creator_name"], d["game"], d["mode"], d["rolls"], d["wins"])
+                    d["creator_name"], d["game"], d["mode"], d["rolls"], d["wins"], d.get("stake", 0))
 
     async def _on_close() -> None:
         await state.clear()
 
     s.on_close = _on_close
+    await s.refresh_limited()
     s.lobby_msg_id = msg.message_id
     manager.add(s)
     await state.set_state(PvP.inviting)
@@ -267,7 +276,7 @@ async def setup_back(cb: CallbackQuery, state: FSMContext) -> None:
     await goto(cb.message, state, ORDER[idx - 1])
 
 
-@router.callback_query(SetupCB.filter(F.step.in_({"game", "mode", "rolls", "wins"})), StateFilter(*SETUP_STATES))
+@router.callback_query(SetupCB.filter(F.step.in_({"game", "mode", "rolls", "wins", "stake"})), StateFilter(*SETUP_STATES))
 async def setup_pick(cb: CallbackQuery, callback_data: SetupCB, state: FSMContext) -> None:
     cur = STEP_OF_STATE.get(await state.get_state())
     if callback_data.step != cur:
@@ -275,37 +284,43 @@ async def setup_pick(cb: CallbackQuery, callback_data: SetupCB, state: FSMContex
     value = validate(cur, callback_data.value)
     if value is None:
         return await cb.answer()
-    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)
+    manager.reserve_setup(cb.message.chat.id, cb.from_user.id)  # keep the wizard alive
     await state.update_data(**{cur: value})
     await cb.answer()
-    if cur == "wins":
+    if cur == "stake":
         return await open_lobby(cb.message, state, await state.get_data())
     await goto(cb.message, state, ORDER[ORDER.index(cur) + 1])
 
 
+# Anyone else touching a wizard menu (or a stale one):
 @router.callback_query(F.data.startswith("su:"))
 async def setup_not_yours(cb: CallbackQuery) -> None:
     await cb.answer("This menu isn't yours (or it expired) ❌", show_alert=True)
 
 
-# ============================================================ invites
-@router.message(Command("invite"), GROUP)
-async def cmd_invite(message: Message) -> None:
-    s = manager.get(message.chat.id)
-    if not s or s.status != "lobby":
-        return await message.reply("No open lobby here. Start one with /pvp.")
-    if not message.from_user or message.from_user.id != s.creator_id:
-        return await message.reply("Only the match creator can invite players ❌")
-
-    targets, unknown = extract_targets(message)
-    try:
+# ============================================================ invites (visible only to the invited player + creator)
+async def run_invites(message: Message, s: GameSession) -> None:
+    """Invite everybody mentioned in `message` (creator only, checked by the callers)."""
+    me = await message.bot.me()
+    targets, unknown = extract_targets(message, me.username or "")
+    still_unknown: list[str] = []
+    for uname in unknown:  # not seen yet -> ask Telegram (works for people the bot already knows)
+        try:
+            chat = await message.bot.get_chat(f"@{uname}")
+            if chat.type == ChatType.PRIVATE and chat.id != message.from_user.id:
+                targets[chat.id] = " ".join(x for x in (chat.first_name, chat.last_name) if x) or uname
+                continue
+        except Exception:
+            pass
+        still_unknown.append(uname)
+    try:  # keep the group clean: remove the creator's message (needs the 'delete messages' right)
         await message.delete()
     except Exception:
         pass
 
     problems: list[str] = []
     for uid, name in targets.items():
-        if uid not in s.invited:
+        if uid not in s.invited:  # re-sending to an already invited player is allowed
             err = s.can_invite(uid)
             if err:
                 problems.append(f"{html.escape(name)}: {err}")
@@ -315,20 +330,55 @@ async def cmd_invite(message: Message) -> None:
         if fail:
             s.invited.pop(uid, None)
             problems.append(fail)
-    for uname in unknown:
+    for uname in still_unknown:
         problems.append(f"@{html.escape(uname)}: I can't find them yet — reply to one of their messages with /invite")
 
     await s.refresh_lobby()
-    if not targets and not unknown:
-        await s.tell_creator("Use <code>/invite @username</code>, or reply to a player's message with /invite.")
+    if not targets and not still_unknown:
+        await s.tell_creator("Type <code>@username</code> of the player (or reply to their message with /invite).")
     elif problems:
         await s.tell_creator("⚠️ Couldn't invite:\n• " + "\n• ".join(problems))
+
+
+@router.message(Command("invite"), GROUP)
+async def cmd_invite(message: Message) -> None:
+    s = manager.get(message.chat.id)
+    if not s or s.status != "lobby":
+        return await message.reply("No open lobby here. Start one with /pvp.")
+    if not message.from_user or message.from_user.id != s.creator_id:
+        return await message.reply("Only the match creator can invite players ❌")
+    await run_invites(message, s)
+
+
+def _mention_only(message: Message) -> bool:
+    """True for a lobby creator's message that contains nothing but @mentions (e.g. '@parshya @rahul')."""
+    if not message.text or not message.entities or not message.from_user:
+        return False
+    s = manager.get(message.chat.id)
+    if not s or s.status != "lobby" or message.from_user.id != s.creator_id:
+        return False
+    raw = message.text.encode("utf-16-le")
+    keep, last, found = [], 0, False
+    for ent in sorted(message.entities, key=lambda e: e.offset):
+        if ent.type in (MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION):
+            keep.append(raw[last * 2:ent.offset * 2])
+            last, found = ent.offset + ent.length, True
+    keep.append(raw[last * 2:])
+    rest = b"".join(keep).decode("utf-16-le")
+    return found and rest.strip(" ,;&+\n\t") == ""
+
+
+@router.message(GROUP, F.text, _mention_only)
+async def on_mention_invite(message: Message) -> None:
+    s = manager.get(message.chat.id)
+    if s and s.status == "lobby":
+        await run_invites(message, s)
 
 
 @router.callback_query(InviteCB.filter())
 async def on_invite(cb: CallbackQuery, callback_data: InviteCB) -> None:
     me = cb.from_user
-    if me.id != callback_data.user_id:
+    if me.id != callback_data.user_id:  # security: the invite works only for the targeted user
         return await cb.answer("This invite is not for you! ❌", show_alert=True)
 
     s = manager.get(callback_data.chat_id)
@@ -350,6 +400,7 @@ async def on_invite(cb: CallbackQuery, callback_data: InviteCB) -> None:
     await cb.answer("You're in! 🎉")
 
 
+# ============================================================ lobby buttons
 @router.callback_query(F.data.in_({"lobby:start", "lobby:cancel"}))
 async def on_lobby(cb: CallbackQuery, state: FSMContext) -> None:
     s = manager.get(cb.message.chat.id)
@@ -371,14 +422,35 @@ async def on_lobby(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PvP.in_match)
 
 
+# ============================================================ in-match: dice
 @router.message(F.dice, GROUP)
 async def on_dice(message: Message) -> None:
     s = manager.get(message.chat.id)
     if not s or s.status != "running" or message.from_user is None:
         return
     if message.forward_origin is not None or message.via_bot is not None:
-        return
+        return  # forwarded / inline-bot dice never count
+    rep = message.reply_to_message
+    if s.limited and not (rep and rep.from_user and rep.from_user.id == message.bot.id):
+        s.limited = False  # we can see plain messages -> the bot can read everything (privacy mode off / admin)
     await s.handle_dice(message.from_user.id, message.dice.emoji, message.dice.value, message.date)
+
+
+@router.callback_query(F.data == "throw")
+async def on_throw(cb: CallbackQuery) -> None:
+    s = manager.get(cb.message.chat.id)
+    if not s or s.status != "running":
+        return await cb.answer("No match is running.", show_alert=True)
+    cur = s.current_player()
+    if cb.from_user.id != cur.id:
+        return await cb.answer(f"It's {cur.name}'s turn ❌", show_alert=True)
+    await cb.answer("Throwing! 🎲")
+    err = await s.throw_button(cb.from_user.id)
+    if err:
+        try:
+            await cb.answer(err, show_alert=True)
+        except Exception:
+            pass
 
 
 @router.message(Command("stop", "cancel"), GROUP)
@@ -402,6 +474,7 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
 
 @router.message(Command("forcestop"), GROUP)
 async def cmd_forcestop(message: Message) -> None:
+    """Emergency switch for the BOT OWNER only (OWNER_IDS env). Players cannot use it."""
     if not message.from_user or message.from_user.id not in OWNER_IDS:
         return
     s = manager.get(message.chat.id)
@@ -411,6 +484,7 @@ async def cmd_forcestop(message: Message) -> None:
     await message.reply("🛑 Match removed by the bot owner (no stats recorded).")
 
 
+# ============================================================ stats / top / history
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
     rep = message.reply_to_message
@@ -419,13 +493,20 @@ async def cmd_stats(message: Message) -> None:
     if not u or u.matches_played == 0:
         return await message.reply(f"{html.escape(target.full_name)} hasn't finished any matches yet.")
     rate = u.wins / u.matches_played * 100
-    await message.reply(
-        f"📊 <b>Stats — {html.escape(u.full_name)}</b>\n"
-        f"🎮 Matches: {u.matches_played}\n"
-        f"🏆 Wins: {u.wins}   💀 Losses: {u.losses}\n"
-        f"📈 Win rate: {rate:.0f}%\n"
-        f"🥇 Rounds won: {u.rounds_won}\n"
-        f"🎯 Total points rolled: {u.total_points}")
+    lines = [
+        f"📊 <b>Stats — {html.escape(u.full_name)}</b>",
+        "",
+        f"🎮 Matches played:  <b>{u.matches_played}</b>",
+        f"🏆 Wins:  <b>{u.wins}</b>   ·   💀 Losses:  <b>{u.losses}</b>",
+        f"📈 Win rate:  <b>{rate:.0f}%</b>",
+        "",
+        f"🥇 Rounds won:  <b>{u.rounds_won}</b>",
+        f"🎯 Total points rolled:  <b>{u.total_points}</b>",
+    ]
+    if u.wagered_cents:
+        lines += ["", f"💰 Virtual balance:  <b>{money_signed(u.net_cents)}</b>",
+                  f"🎟 Total staked:  {money(u.wagered_cents)}"]
+    await message.reply("\n".join(lines))
 
 
 @router.message(Command("top"))
@@ -433,12 +514,13 @@ async def cmd_top(message: Message) -> None:
     rows = await database.top_players(10)
     if not rows:
         return await message.reply("No finished matches yet — be the first! /pvp")
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏅 <b>Leaderboard</b>"]
+    blocks = ["🏅 <b>Leaderboard</b>"]
     for i, u in enumerate(rows):
-        lines.append(f"{medals[i] if i < 3 else f'{i + 1}.'} {html.escape(u.full_name)} — "
-                     f"{u.wins}W / {u.losses}L ({u.wins / u.matches_played * 100:.0f}%)")
-    await message.reply("\n".join(lines))
+        rate = u.wins / u.matches_played * 100
+        extra = f" · 💰 {money_signed(u.net_cents)}" if u.wagered_cents else ""
+        blocks.append(f"{MEDALS[i] if i < 3 else f'<b>{i + 1}.</b>'} <b>{html.escape(u.full_name)}</b>\n"
+                      f"└ {u.wins}W · {u.losses}L · {rate:.0f}%{extra}")
+    await message.reply("\n\n".join(blocks))
 
 
 @router.message(Command("history"))
@@ -446,16 +528,27 @@ async def cmd_history(message: Message) -> None:
     rows = await database.recent_matches(message.from_user.id, 5)
     if not rows:
         return await message.reply("No match history yet.")
-    lines = ["🕘 <b>Your last matches</b>"]
-    for r in rows:
-        m = r.Match
+    me_id = message.from_user.id
+    blocks = ["🕘 <b>Your last matches</b>"]
+    for m in rows:
         emoji = GAMES.get(m.game, ("🎮",))[0]
-        result = "✅ Won" if r.is_winner else f"❌ Lost (winner: {html.escape(m.winner_name)})"
-        lines.append(f"#{m.id} {emoji} {MODES.get(m.mode, ('', m.mode))[1]} · {m.player_count} players · "
-                     f"you {r.series_wins}/{m.target_wins} · {result} · {m.finished_at:%d %b %Y}")
-    await message.reply("\n".join(lines))
+        mode_e, mode_n = MODES.get(m.mode, ("", m.mode))[:2]
+        stake = f"💰 {money(m.stake_cents)}" if m.stake_cents else "🆓 Free"
+        head = (f"<b>#{m.id}</b> · {emoji} {mode_e} {mode_n} · {m.player_count} players\n"
+                f"<i>{m.rolls} roll(s) · first to {m.target_wins} · {stake} · {m.finished_at:%d %b %Y}</i>")
+        standing = []
+        for i, p in enumerate(m.players):
+            name = html.escape(p["name"])
+            if p["user_id"] == me_id:
+                name = f"<b>{name} (you)</b>"
+            standing.append(f"{MEDALS[i] if i < 3 else '▫️'} {name} — {p['series_wins']}")
+        money_txt = f" {money_signed(m.net_cents)}" if m.stake_cents else ""
+        result = f"✅ <b>Won</b>{money_txt}" if m.is_winner else f"❌ <b>Lost</b>{money_txt}"
+        blocks.append(f"{head}\n<blockquote>{chr(10).join(standing)}</blockquote>\n{result}")
+    await message.reply("\n\n".join(blocks))
 
 
+# ============================================================ main
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -483,10 +576,10 @@ async def main() -> None:
     ])
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await manager.restore_all(bot)
+        await manager.restore_all(bot)  # continue matches that were running before the restart
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await manager.shutdown(bot)
+        await manager.shutdown(bot)     # running matches are saved, not cancelled
         await database.close_db()
         await bot.session.close()
 
