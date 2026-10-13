@@ -10,7 +10,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,6 +20,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 import database
+import jackpot
+from jackpot import JackpotInviteCB, parse_amount
 from game import (GAMES, MAX_PLAYERS, MEDALS, MIN_PLAYERS, MODES, STAKES, GameSession, InviteCB, btn,
                   lobby_markup, manager, mention, money, money_signed)
 
@@ -187,6 +189,7 @@ HELP = (
     "🎮 <b>PvP Games Bot</b>\n\n"
     "/pvp — set up a match in a group (2–7 players)\n"
     "/invite @username — invite a player (or just type @username as the lobby creator, or reply with /invite)\n"
+    "/jackpot [amount] — start/join a 🎰 Jackpot: everyone bets, a wheel picks ONE winner who takes the whole pot\n"
     "/stats · /top · /history — your stats, leaderboard, last matches\n\n"
     "On your turn, send the game emoji yourself (🎲 🏀 ⚽ 🎳 🎯). If I'm not an admin, reply to my message with it "
     "or tap the button. No throw within 60s (I warn you at 30s) and I throw for you.\n"
@@ -299,8 +302,9 @@ async def setup_not_yours(cb: CallbackQuery) -> None:
 
 
 # ============================================================ invites (visible only to the invited player + creator)
-async def run_invites(message: Message, s: GameSession) -> None:
-    """Invite everybody mentioned in `message` (creator only, checked by the callers)."""
+async def collect_targets(message: Message) -> tuple[dict[int, str], list[str]]:
+    """Everybody mentioned in the creator's message -> ({id: name}, usernames we couldn't resolve).
+    Also removes the creator's message to keep the group clean (needs 'delete messages')."""
     me = await message.bot.me()
     targets, unknown = extract_targets(message, me.username or "")
     still_unknown: list[str] = []
@@ -313,10 +317,16 @@ async def run_invites(message: Message, s: GameSession) -> None:
         except Exception:
             pass
         still_unknown.append(uname)
-    try:  # keep the group clean: remove the creator's message (needs the 'delete messages' right)
+    try:
         await message.delete()
     except Exception:
         pass
+    return targets, still_unknown
+
+
+async def run_invites(message: Message, s: GameSession) -> None:
+    """Invite everybody mentioned in `message` (creator only, checked by the callers)."""
+    targets, still_unknown = await collect_targets(message)
 
     problems: list[str] = []
     for uid, name in targets.items():
@@ -340,14 +350,42 @@ async def run_invites(message: Message, s: GameSession) -> None:
         await s.tell_creator("⚠️ Couldn't invite:\n• " + "\n• ".join(problems))
 
 
+async def run_jp_invites(message: Message, j: "jackpot.JackpotSession") -> None:
+    targets, still_unknown = await collect_targets(message)
+    problems: list[str] = []
+    for uid, name in targets.items():
+        if uid not in j.invited:
+            err = j.can_invite(uid)
+            if err:
+                problems.append(f"{html.escape(name)}: {err}")
+                continue
+        j.invited[uid] = name
+        fail = await j.send_invite(uid, name)
+        if fail:
+            j.invited.pop(uid, None)
+            problems.append(fail)
+    for uname in still_unknown:
+        problems.append(f"@{html.escape(uname)}: I can't find them yet — reply to one of their messages with /invite")
+    if not targets and not still_unknown:
+        await j.tell_creator("Type <code>@username</code> of the player (or reply to their message with /invite).")
+    elif problems:
+        await j.tell_creator("⚠️ Couldn't invite:\n• " + "\n• ".join(problems))
+
+
 @router.message(Command("invite"), GROUP)
 async def cmd_invite(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
     s = manager.get(message.chat.id)
-    if not s or s.status != "lobby":
-        return await message.reply("No open lobby here. Start one with /pvp.")
-    if not message.from_user or message.from_user.id != s.creator_id:
-        return await message.reply("Only the match creator can invite players ❌")
-    await run_invites(message, s)
+    if s and s.status == "lobby":
+        if uid != s.creator_id:
+            return await message.reply("Only the match creator can invite players ❌")
+        return await run_invites(message, s)
+    j = jackpot.manager.get(message.chat.id)
+    if j and j.status in ("lobby", "countdown"):
+        if uid != j.creator_id:
+            return await message.reply("Only the jackpot creator can invite players ❌")
+        return await run_jp_invites(message, j)
+    await message.reply("No open lobby here. Start one with /pvp or /jackpot.")
 
 
 def _mention_only(message: Message) -> bool:
@@ -357,6 +395,10 @@ def _mention_only(message: Message) -> bool:
     s = manager.get(message.chat.id)
     if not s or s.status != "lobby" or message.from_user.id != s.creator_id:
         return False
+    return _only_mentions(message)
+
+
+def _only_mentions(message: Message) -> bool:
     raw = message.text.encode("utf-16-le")
     keep, last, found = [], 0, False
     for ent in sorted(message.entities, key=lambda e: e.offset):
@@ -373,6 +415,95 @@ async def on_mention_invite(message: Message) -> None:
     s = manager.get(message.chat.id)
     if s and s.status == "lobby":
         await run_invites(message, s)
+
+
+def _jp_mention_only(message: Message) -> bool:
+    if not message.text or not message.entities or not message.from_user:
+        return False
+    j = jackpot.manager.get(message.chat.id)
+    if not j or j.status not in ("lobby", "countdown") or message.from_user.id != j.creator_id:
+        return False
+    return _only_mentions(message)
+
+
+@router.message(GROUP, F.text, _jp_mention_only)
+async def on_jp_mention_invite(message: Message) -> None:
+    j = jackpot.manager.get(message.chat.id)
+    if j and j.status in ("lobby", "countdown"):
+        await run_jp_invites(message, j)
+
+
+# ============================================================ jackpot
+@router.message(Command("jackpot"), ~GROUP)
+async def cmd_jackpot_private(message: Message) -> None:
+    await message.answer("Add me to a group and use /jackpot there 🎰")
+
+
+@router.message(Command("jackpot"), GROUP)
+async def cmd_jackpot(message: Message, command: CommandObject) -> None:
+    user = message.from_user
+    if user is None or user.is_bot:
+        return await message.reply("⚠️ Please turn off anonymous-admin mode to play.")
+    cents = None
+    if command.args:
+        cents = parse_amount(command.args.split()[0])
+        if cents is None:
+            return await message.reply("Use it like <code>/jackpot 10</code> (amount in $).")
+    j = jackpot.manager.get(message.chat.id)
+    created = j is None
+    if created:
+        j = jackpot.JackpotSession(message.bot, message.chat.id,
+                                   message.message_thread_id if message.is_topic_message else None,
+                                   user.id, user.full_name, await database.get_jackpot_meta())
+        jackpot.manager.sessions[message.chat.id] = j
+        await j.open()
+    elif j.status == "spinning":
+        return await message.reply("🎡 The wheel is spinning — wait for the result!")
+    if cents is None:
+        if created:
+            return  # just opened: the jackpot message explains everything
+        return await message.reply("Pick an amount: press a button on the jackpot message, or <code>/jackpot 10</code>.")
+    err, info = await j.place_bet(user.id, user.full_name, cents)
+    await message.reply(err or info)
+
+
+@router.callback_query(F.data.startswith("jp:"))
+async def on_jackpot_button(cb: CallbackQuery) -> None:
+    j = jackpot.manager.get(cb.message.chat.id)
+    if not j or cb.message.message_id != j.msg_id or j.status not in ("lobby", "countdown"):
+        return await cb.answer("This jackpot is closed.", show_alert=True)
+    parts = cb.data.split(":")
+    if parts[1] == "cancel":
+        if cb.from_user.id != j.creator_id:
+            return await cb.answer("Only the jackpot creator can cancel! ❌", show_alert=True)
+        if j.status != "lobby":
+            return await cb.answer("Too late — the countdown has started.", show_alert=True)
+        await j._edit_caption("❌ Jackpot cancelled by the creator.", markup=None)
+        await j.close_invites("❌ The jackpot was cancelled.")
+        await jackpot.manager.close(j)
+        return await cb.answer("Cancelled")
+    cents = int(parts[2])
+    err, info = await j.place_bet(cb.from_user.id, cb.from_user.full_name, cents)
+    await cb.answer(err or info, show_alert=bool(err))
+
+
+@router.callback_query(JackpotInviteCB.filter())
+async def on_jackpot_invite(cb: CallbackQuery, callback_data: JackpotInviteCB) -> None:
+    me = cb.from_user
+    if me.id != callback_data.user_id:
+        return await cb.answer("This invite is not for you! ❌", show_alert=True)
+    j = jackpot.manager.get(callback_data.chat_id)
+    if not j or j.status not in ("lobby", "countdown") or (me.id not in j.invited and me.id not in j.bets):
+        return await cb.answer("This invite has expired.", show_alert=True)
+    if callback_data.action == "no":
+        await j.resolve_invite(me.id, "❌ You declined the jackpot invite.",
+                               f"❌ {html.escape(me.full_name)} declined your jackpot invite.")
+        return await cb.answer("Declined")
+    err, info = await j.place_bet(me.id, me.full_name, callback_data.cents)
+    if err:
+        return await cb.answer(err, show_alert=True)
+    await j.resolve_invite(me.id, info, f"✅ {html.escape(me.full_name)} joined with {money(callback_data.cents)}")
+    await cb.answer("You're in! 🎰")
 
 
 @router.callback_query(InviteCB.filter())
@@ -506,6 +637,9 @@ async def cmd_stats(message: Message) -> None:
     if u.wagered_cents:
         lines += ["", f"💰 Virtual balance:  <b>{money_signed(u.net_cents)}</b>",
                   f"🎟 Total staked:  {money(u.wagered_cents)}"]
+    if u.jp_played:
+        lines += ["", f"🎰 Jackpots:  played <b>{u.jp_played}</b> · won <b>{u.jp_wins}</b> · "
+                      f"net <b>{money_signed(u.jp_net_cents)}</b>"]
     await message.reply("\n".join(lines))
 
 
@@ -568,6 +702,7 @@ async def main() -> None:
 
     await bot.set_my_commands([
         BotCommand(command="pvp", description="Start a PvP match"),
+        BotCommand(command="jackpot", description="Start / join a Jackpot"),
         BotCommand(command="invite", description="Invite a player to the lobby"),
         BotCommand(command="stats", description="Your stats"),
         BotCommand(command="top", description="Leaderboard"),
@@ -580,6 +715,7 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await manager.shutdown(bot)     # running matches are saved, not cancelled
+        await jackpot.manager.shutdown()
         await database.close_db()
         await bot.session.close()
 
