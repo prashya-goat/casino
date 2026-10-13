@@ -53,7 +53,8 @@ def _user(doc: Optional[dict]) -> Optional[SimpleNamespace]:
         matches_played=doc.get("matches_played", 0), wins=doc.get("wins", 0),
         losses=doc.get("losses", 0), rounds_won=doc.get("rounds_won", 0),
         total_points=doc.get("total_points", 0), net_cents=doc.get("net_cents", 0),
-        wagered_cents=doc.get("wagered_cents", 0))
+        wagered_cents=doc.get("wagered_cents", 0), jp_played=doc.get("jp_played", 0),
+        jp_wins=doc.get("jp_wins", 0), jp_net_cents=doc.get("jp_net_cents", 0))
 
 
 async def get_user(uid: int):
@@ -113,6 +114,39 @@ async def recent_matches(uid: int, limit: int = 5):
             is_winner=me.get("is_winner", False), series_wins=me.get("series_wins", 0),
             net_cents=me.get("net_cents", 0)))
     return rows
+
+
+# --------------------------------------------------------------------------- jackpot
+async def get_jackpot_meta() -> dict:
+    return await db.meta.find_one({"_id": "jackpot"}) or {}
+
+
+async def record_jackpot(*, chat_id: int, pot_cents: int, winner_id: int, winner_name: str,
+                         players: list, commit: str, seed: str) -> dict:
+    """players = [(user_id, name, bet_cents)]. Winner takes the whole pot (no house cut)."""
+    counter = await db.counters.find_one_and_update(
+        {"_id": "jackpots"}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+    now = utcnow()
+    await db.jackpots.insert_one({
+        "_id": counter["seq"], "chat_id": chat_id, "pot_cents": pot_cents, "winner_id": winner_id,
+        "winner_name": winner_name, "commit": commit, "seed": seed, "finished_at": now,
+        "players": [{"user_id": u, "name": n, "cents": c} for u, n, c in players]})
+    for uid, name, cents in players:
+        won = uid == winner_id
+        await db.users.update_one(
+            {"_id": uid},
+            {"$inc": {"jp_played": 1, "jp_wins": 1 if won else 0,
+                      "jp_net_cents": (pot_cents - cents) if won else -cents, "jp_wagered_cents": cents},
+             "$set": {"full_name": name, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+            upsert=True)
+    meta = await get_jackpot_meta()
+    is_record = pot_cents > meta.get("record_cents", 0)
+    upd = {"last_name": winner_name, "last_cents": pot_cents, "last_at": now}
+    if is_record:
+        upd.update(record_cents=pot_cents, record_name=winner_name)
+    await db.meta.update_one({"_id": "jackpot"}, {"$set": upd}, upsert=True)
+    return {"is_record": is_record, "record_cents": upd.get("record_cents", meta.get("record_cents", 0)),
+            "record_name": upd.get("record_name", meta.get("record_name", ""))}
 
 
 # --------------------------------------------------------------------------- running matches
