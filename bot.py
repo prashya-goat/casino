@@ -193,7 +193,7 @@ HELP = (
     "/stats · /top · /history — your stats, leaderboard, last matches\n\n"
     "On your turn, send the game emoji yourself (🎲 🏀 ⚽ 🎳 🎯). If I'm not an admin, reply to my message with it "
     "or tap the button. No throw within 60s (I warn you at 30s) and I throw for you.\n"
-    "⚠️ Once a match has started it can't be stopped."
+    "/stop — the match creator can stop a running match (no stats are recorded)"
 )
 
 
@@ -589,7 +589,11 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
     uid, chat_id = (message.from_user.id if message.from_user else 0), message.chat.id
     s = manager.get(chat_id)
     if s and s.status == "running":
-        return await message.reply("🔒 The match has already started — it can't be stopped.")
+        if uid != s.creator_id:
+            return await message.reply("Only the match creator can stop the match ❌")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[btn("🛑 Yes, stop", "stop:yes", "danger"),
+                                                    btn("↩️ Keep playing", "stop:no", "success")]])
+        return await message.reply("🛑 <b>Stop the running match?</b>\nNo stats will be recorded.", reply_markup=kb)
     if not s:
         owner = manager.setup_owner(chat_id)
         if owner and (uid == owner or await is_admin(bot, chat_id, uid)):
@@ -601,6 +605,28 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
     await s.edit(s.lobby_msg_id, "❌ Lobby cancelled.")
     await s.close_invites("❌ The lobby was cancelled.")
     await manager.close(s)
+
+
+@router.callback_query(F.data.in_({"stop:yes", "stop:no"}))
+async def on_stop_confirm(cb: CallbackQuery) -> None:
+    s = manager.get(cb.message.chat.id)
+    if not s or s.status != "running":
+        try:
+            await cb.message.edit_text("This match is already over.")
+        except Exception:
+            pass
+        return await cb.answer()
+    if cb.from_user.id != s.creator_id:
+        return await cb.answer("Only the match creator can do this! ❌", show_alert=True)
+    if cb.data == "stop:no":
+        await cb.message.edit_text("👍 Okay, the match continues.")
+        return await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.answer("Match stopped")
+    await s.stop_match(cb.from_user.full_name)
 
 
 @router.message(Command("forcestop"), GROUP)
