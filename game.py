@@ -7,7 +7,7 @@
   the "Throw for me" button.
 * The full match state is saved to MongoDB after every roll, so a redeploy/restart
   resumes the match exactly where it stopped (see SessionManager.restore_all).
-* A started match cannot be stopped.  Stakes are virtual (stats only) - no real money.
+* Only the creator can stop a running match (/stop).  Stakes are virtual (stats only) - no real money.
 """
 import asyncio
 import html
@@ -310,7 +310,7 @@ class GameSession:
         lines += [
             "Only the invited player (and you) can see the invite.",
             f"Need {MIN_PLAYERS}–{MAX_PLAYERS} players, then press ▶️ Start. "
-            "<b>A started match cannot be stopped.</b>",
+            "Once started, only the creator can stop it with /stop.",
         ]
         return "\n".join(lines)
 
@@ -676,6 +676,29 @@ class GameSession:
             pass
         finally:
             await manager.close(self)
+
+    # ------------------------------------------------------------- stop (creator only)
+    async def stop_match(self, by_name: str) -> bool:
+        """Creator stops a running match: no stats recorded, the saved state is deleted."""
+        async with self.lock:
+            if self.status != "running":
+                return False
+            await manager.close(self)          # status -> closed, timer + warning message cleaned up
+        if self._saver and not self._saver.done():
+            try:
+                await self._saver              # make sure no late save can bring the match back
+            except Exception:
+                pass
+        try:
+            await database.delete_active(self.chat_id)
+        except Exception:
+            log.exception("delete_active failed")
+        try:
+            await self.send(f"🛑 <b>Match stopped by {esc(by_name)}.</b> No stats were recorded.\n"
+                            "Use /pvp to start a new one.")
+        except Exception:
+            pass
+        return True
 
     # ------------------------------------------------------------- finish
     async def _finish(self, winner: Player, block: str) -> None:
